@@ -4,6 +4,7 @@ Clickhouse-disks controls temporary cloud storage disks management.
 
 import copy
 import os
+import shutil
 from functools import partial
 from subprocess import PIPE, Popen
 from types import TracebackType
@@ -60,13 +61,18 @@ class ClickHouseTemporaryDisks:
         self._backup_layout = backup_layout
         self._config = config["backup"]
         self._config_dir = config["clickhouse"]["config_dir"]
+        self._credentials = config["storage"]["credentials"]
         self._backup_meta = backup_meta
         self._ch_config = ch_config
         self._use_local_copy = use_local_copy
         self._source_bucket: str = source_bucket or ""
         self._source_path: str = source_path or ""
         self._source_endpoint: str = source_endpoint or ""
-        if self._backup_meta.cloud_storage.enabled and source_bucket is None:
+        if (
+            self._backup_meta.cloud_storage.enabled
+            and not self._backup_meta.cloud_storage.data_copied
+            and source_bucket is None
+        ):
             raise RuntimeError(
                 "Backup contains cloud storage data, cloud-storage-source-bucket must be set."
             )
@@ -84,22 +90,11 @@ class ClickHouseTemporaryDisks:
             self._create_temporary_disk(
                 self._backup_meta,
                 disk_name,
-                self._source_bucket,
-                self._source_path,
-                self._source_endpoint,
                 self._desired_tables,
             )
         self._backup_layout.wait()
         self._ch_availible_disks = self._ch_ctl.get_disks()
-        self._render_disks_config(
-            CH_DISK_CONFIG_PATH,
-            {
-                name: conf
-                for name, conf in self._disks.items()
-                if not conf or conf.get("type") != "cache"
-            },
-            history_file=CH_DISK_HISTORY_FILE_PATH,
-        )
+        _render_ch_disks_config(self._disks)
         return self
 
     def __exit__(
@@ -124,26 +119,10 @@ class ClickHouseTemporaryDisks:
                 pass
         return True
 
-    def _render_disks_config(self, path, disks, history_file=None):
-        config = {"storage_configuration": {"disks": disks}}
-        if history_file is not None:
-            config["history-file"] = history_file
-
-        with open(path, "w", encoding="utf-8") as f:
-            xmltodict.unparse(
-                {"clickhouse": config},
-                f,
-                pretty=True,
-            )
-
-    # pylint: disable=too-many-positional-arguments
     def _create_temporary_disk(
         self,
         backup_meta: BackupMetadata,
         disk_name: str,
-        source_bucket: str,
-        source_path: str,
-        source_endpoint: str,
         desired_tables: Sequence[TableMetadata] | Literal["all"] = "all",
     ) -> None:
         tmp_disk_name = _get_tmp_disk_name(disk_name)
@@ -156,13 +135,9 @@ class ClickHouseTemporaryDisks:
             )
         disk_config = copy.copy(self._disks[disk_name])
 
-        endpoint = urlparse(disk_config["endpoint"])
-        endpoint_netloc = source_endpoint or endpoint.netloc
-
-        tmp_disk_endpoint = os.path.join(
-            f"{endpoint.scheme}://{endpoint_netloc}", source_bucket, source_path, ""
-        )
         orig_disk_endpoint = self._disks[disk_name]["endpoint"]
+        self._set_disk_source(disk_config, disk_name)
+        tmp_disk_endpoint = disk_config["endpoint"]
 
         if self._use_local_copy and not is_equal_s3_endpoints(
             tmp_disk_endpoint, orig_disk_endpoint
@@ -171,8 +146,6 @@ class ClickHouseTemporaryDisks:
                 f"Endpoint of tmp object storage disk is not equal to original (original {orig_disk_endpoint}  tmp: {tmp_disk_endpoint})."
                 "It is required for inplace restore mode."
             )
-
-        disk_config["endpoint"] = tmp_disk_endpoint
 
         disks_config = {tmp_disk_name: disk_config}
 
@@ -194,7 +167,7 @@ class ClickHouseTemporaryDisks:
 
         disks_config[tmp_disk_name]["skip_access_check"] = str(True).lower()
 
-        self._render_disks_config(
+        _render_disks_config(
             _get_config_path(self._config_dir, tmp_disk_name),
             disks_config,
         )
@@ -211,6 +184,32 @@ class ClickHouseTemporaryDisks:
 
         self._created_disks[tmp_disk_name] = source_disk
         self._disks[tmp_disk_name] = disks_config[tmp_disk_name]
+
+    def _set_disk_source(self, disk_config: Dict, disk_name: str) -> None:
+        """
+        Point a temporary disk configuration to the location of the data.
+
+        Data copied into the backup is read from the backup bucket, the rest
+        from the bucket of the source ClickHouse installation.
+        """
+        if self._backup_meta.cloud_storage.data_copied:
+            disk_config["endpoint"] = _backup_disk_endpoint(
+                self._credentials,
+                self._config["path_root"],
+                self._backup_meta,
+                disk_name,
+            )
+            disk_config["access_key_id"] = self._credentials["access_key_id"]
+            disk_config["secret_access_key"] = self._credentials["secret_access_key"]
+            return
+
+        endpoint = urlparse(disk_config["endpoint"])
+        disk_config["endpoint"] = os.path.join(
+            f"{endpoint.scheme}://{self._source_endpoint or endpoint.netloc}",
+            self._source_bucket,
+            self._source_path,
+            "",
+        )
 
     def copy_parts(
         self,
@@ -293,7 +292,9 @@ class ClickHouseTemporaryDisks:
         if self._use_local_copy:
             self._os_copy(from_disk, from_path, to_disk, to_path, routine_tag)
         else:
-            self._ch_disks_copy(from_disk, from_path, to_disk, to_path, routine_tag)
+            _ch_disks_copy(
+                self._ch_ctl, from_disk, from_path, to_disk, to_path, routine_tag
+            )
 
     # pylint: disable=too-many-positional-arguments
     def _os_copy(
@@ -314,66 +315,253 @@ class ClickHouseTemporaryDisks:
         )
         logging.info(f"os copy result for {routine_tag}: {result}")
 
-    # pylint: disable=too-many-positional-arguments
-    def _ch_disks_copy(
-        self,
-        from_disk: str,
-        from_path: str,
-        to_disk: str,
-        to_path: str,
-        routine_tag: str,
-    ) -> None:
-        command = "copy"
-        common_args = ["--config", CH_DISK_CONFIG_PATH]
-        if self._ch_ctl.ch_version_ge("24.7"):
-            command_args = [
-                "--recursive",
-                "--disk-from",
-                from_disk,
-                "--disk-to",
-                to_disk,
-                from_path,
-                to_path,
-                "'",
-            ]
-            common_args.append("--query")
-            # Changes in disks interface require passing command with args in quotes
-            command = "'" + command
-        elif self._ch_ctl.ch_version_ge("23.9"):
-            command_args = [
-                "--disk-from",
-                from_disk,
-                "--disk-to",
-                to_disk,
-                from_path,
-                to_path,
-            ]
-        else:
-            command_args = [
-                "--diskFrom",
-                from_disk,
-                "--diskTo",
-                to_disk,
-                from_path,
-                to_path,
-            ]
 
-        result = _exec(
-            routine_tag,
-            exe="/usr/bin/clickhouse-disks",
-            common_args=common_args,
-            command=command,
-            command_args=command_args,
+class ClickHouseBackupDisks:
+    """
+    Manages temporary cloud storage disks pointing to the backup bucket.
+    """
+
+    def __init__(
+        self,
+        ch_ctl: ClickhouseCTL,
+        config: Config,
+        backup_meta: BackupMetadata,
+        ch_config: ClickhouseConfig,
+    ) -> None:
+        self._ch_ctl = ch_ctl
+        self._config_dir = config["clickhouse"]["config_dir"]
+        self._path_root = config["backup"]["path_root"]
+        self._credentials = config["storage"]["credentials"]
+        self._backup_meta = backup_meta
+        self._ch_config = ch_config
+
+        self._disks: Dict[str, Dict] = {}
+        self._created_disks: Dict[str, Disk] = {}
+
+    def __enter__(self) -> "ClickHouseBackupDisks":
+        """
+        Read currently configured disks from the ClickHouse configuration.
+        """
+        self._disks = self._ch_config.config.get("storage_configuration", {}).get(
+            "disks", {}
         )
-        logging.info(f"clickhouse-disks copy result for {routine_tag}: {result}")
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        value: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> None:
+        """
+        Remove configuration files and local metadata of the created disks.
+        """
+        for disk_name, disk in self._created_disks.items():
+            logging.debug(f"Removing tmp disk {disk_name}")
+            try:
+                os.remove(_get_config_path(self._config_dir, disk_name))
+            except FileNotFoundError:
+                pass
+            shutil.rmtree(os.path.join(disk.path, "shadow"), ignore_errors=True)
+            self._disks.pop(disk_name, None)
+        self._created_disks.clear()
+
+    def create_disk(self, disk_name: str) -> Disk:
+        """
+        Create a temporary disk that writes to the backup bucket.
+
+        Returns the already created disk if called for the same disk twice.
+        """
+        tmp_disk_name = _get_backup_disk_name(disk_name)
+        if tmp_disk_name in self._created_disks:
+            return self._created_disks[tmp_disk_name]
+
+        if disk_name not in self._disks:
+            raise ClickHouseDisksException(
+                f'Disk "{disk_name}" is missing from ClickHouse storage_configuration.'
+            )
+
+        logging.debug(f"Creating tmp disk {tmp_disk_name}")
+        disk_config = copy.copy(self._disks[disk_name])
+        disk_config["endpoint"] = _backup_disk_endpoint(
+            self._credentials, self._path_root, self._backup_meta, disk_name
+        )
+        disk_config["access_key_id"] = self._credentials["access_key_id"]
+        disk_config["secret_access_key"] = self._credentials["secret_access_key"]
+        disk_config["request_timeout_ms"] = str(CH_OBJECT_STORAGE_REQUEST_TIMEOUT_MS)
+
+        _render_disks_config(
+            _get_config_path(self._config_dir, tmp_disk_name),
+            {tmp_disk_name: disk_config},
+        )
+        self._ch_ctl.reload_config()
+
+        disk = self._ch_ctl.get_disk(tmp_disk_name)
+        self._created_disks[tmp_disk_name] = disk
+        self._disks[tmp_disk_name] = disk_config
+        _render_ch_disks_config(self._disks)
+        return disk
+
+    def copy_table_data(self, disk_name: str, table: Table) -> Disk:
+        """
+        Copy frozen table data from a given disk into the backup bucket.
+
+        Returns the temporary disk holding metadata of the copied objects.
+        """
+        assert table.path_on_disk, f"Table {table} doesn't store data on disk"
+
+        backup_disk = self.create_disk(disk_name)
+        shadow_path = os.path.join(
+            "shadow",
+            self._backup_meta.get_sanitized_name(),
+            table.path_on_disk,
+            "",
+        )
+        # clickhouse-disks creates the last directory of the destination itself,
+        # fails if the rest of the path is missing and nests the copy one level
+        # deeper if the directory already exists
+        target_path = os.path.join(backup_disk.path, shadow_path)
+        os.makedirs(os.path.dirname(target_path.rstrip("/")), exist_ok=True)
+        _ch_disks_copy(
+            self._ch_ctl,
+            disk_name,
+            shadow_path,
+            backup_disk.name,
+            shadow_path,
+            f"Backup of {table.database}.{table.name} on disk {disk_name}",
+        )
+        return backup_disk
+
+
+def _backup_disk_endpoint(
+    credentials: Dict, path_root: str, backup_meta: BackupMetadata, disk_name: str
+) -> str:
+    """
+    Build the backup bucket URL where data of a given disk is stored.
+    """
+    prefix = "/".join(
+        part.strip("/")
+        for part in (
+            credentials["bucket"],
+            path_root,
+            backup_meta.get_sanitized_name(),
+            "cloud_storage",
+            disk_name,
+        )
+        if part
+    )
+    return f"{credentials['endpoint_url'].rstrip('/')}/{prefix}/"
+
+
+def _render_disks_config(
+    path: str, disks: Dict, history_file: Optional[str] = None
+) -> None:
+    """
+    Write disks configuration as a ClickHouse config file.
+    """
+    config: Dict[str, Any] = {"storage_configuration": {"disks": disks}}
+    if history_file is not None:
+        config["history-file"] = history_file
+
+    with open(path, "w", encoding="utf-8") as f:
+        xmltodict.unparse(
+            {"clickhouse": config},
+            f,
+            pretty=True,
+        )
+
+
+def _render_ch_disks_config(disks: Dict[str, Dict]) -> None:
+    """
+    Write configuration of the clickhouse-disks utility.
+    """
+    _render_disks_config(
+        CH_DISK_CONFIG_PATH,
+        {
+            name: conf
+            for name, conf in disks.items()
+            if not conf or conf.get("type") != "cache"
+        },
+        history_file=CH_DISK_HISTORY_FILE_PATH,
+    )
+
+
+# pylint: disable=too-many-positional-arguments
+def _ch_disks_copy(
+    ch_ctl: ClickhouseCTL,
+    from_disk: str,
+    from_path: str,
+    to_disk: str,
+    to_path: str,
+    routine_tag: str,
+) -> None:
+    """
+    Copy a directory between disks with the clickhouse-disks utility.
+    """
+    command = "copy"
+    common_args = ["--config", CH_DISK_CONFIG_PATH]
+    if ch_ctl.ch_version_ge("24.7"):
+        command_args = [
+            "--recursive",
+            "--disk-from",
+            from_disk,
+            "--disk-to",
+            to_disk,
+            from_path,
+            to_path,
+            "'",
+        ]
+        common_args.append("--query")
+        # Changes in disks interface require passing command with args in quotes
+        command = "'" + command
+    elif ch_ctl.ch_version_ge("23.9"):
+        command_args = [
+            "--disk-from",
+            from_disk,
+            "--disk-to",
+            to_disk,
+            from_path,
+            to_path,
+        ]
+    else:
+        command_args = [
+            "--diskFrom",
+            from_disk,
+            "--diskTo",
+            to_disk,
+            from_path,
+            to_path,
+        ]
+
+    result = _exec(
+        routine_tag,
+        exe="/usr/bin/clickhouse-disks",
+        common_args=common_args,
+        command=command,
+        command_args=command_args,
+    )
+    logging.info(f"clickhouse-disks copy result for {routine_tag}: {result}")
 
 
 def _get_config_path(config_dir: str, disk_name: str) -> str:
+    """
+    Return path of the config file generated for a temporary disk.
+    """
     return os.path.join(config_dir, f"cloud_storage_tmp_disk_{disk_name}.xml")
 
 
 def _get_tmp_disk_name(disk_name: str) -> str:
+    """
+    Return name of the temporary disk used to restore data of a given disk.
+    """
     return f"{disk_name}_source"
+
+
+def _get_backup_disk_name(disk_name: str) -> str:
+    """
+    Return name of the temporary disk used to back up data of a given disk.
+    """
+    return f"{disk_name}_backup"
 
 
 def _exec(

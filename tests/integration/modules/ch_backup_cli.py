@@ -236,11 +236,14 @@ class BackupManager:
         schema: bool = None,
         udf: bool = None,
         nc: bool = None,
+        copy_cloud_storage_data: bool = False,
     ) -> str:
         """
         Execute backup command.
         """
         options = [f"--name {name}"]
+        if copy_cloud_storage_data:
+            options.append("--copy-cloud-storage-data")
         if force:
             options.append("--force")
         if databases:

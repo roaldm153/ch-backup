@@ -133,6 +133,7 @@ DEFAULT_CONFIG = {
     "cloud_storage": {
         "encryption": True,
         "compression": True,
+        "copy_data": False,
     },
     "compression": {
         "type": "gzip",

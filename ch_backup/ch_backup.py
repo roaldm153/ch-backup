@@ -259,7 +259,10 @@ class ClickhouseBackup:
             and sources.data
             and not skip_cloud_storage
         ):
-            if self._context.backup_meta.cloud_storage.enabled:
+            if (
+                self._context.backup_meta.cloud_storage.enabled
+                and not self._context.backup_meta.cloud_storage.data_copied
+            ):
                 raise ClickhouseBackupError(
                     "Cloud storage source bucket must be set if backup has data on S3 disks"
                 )

@@ -1,0 +1,36 @@
+name: object_storage_copy
+
+on:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: object storage copy (ClickHouse ${{ matrix.clickhouse }})
+    strategy:
+      fail-fast: false
+      matrix:
+        clickhouse: ["24.8.14.39", "25.8.23.13", "latest"]
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v7
+    - uses: astral-sh/setup-uv@v7
+      with:
+        python-version: "3.10"
+    - name: run unit tests
+      run: make test-unit
+    - name: run object storage copy scenarios
+      run: make test-integration BEHAVE_ARGS="--tags=object_storage_copy"
+      env:
+        CLICKHOUSE_VERSION: ${{ matrix.clickhouse }}
+    - uses: actions/upload-artifact@v7
+      if: ${{ failure() }}
+      with:
+        name: integration-test-logs-clickhouse-${{ matrix.clickhouse }}
+        path: staging/logs/
+        if-no-files-found: ignore

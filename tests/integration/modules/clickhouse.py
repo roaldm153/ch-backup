@@ -167,6 +167,24 @@ class ClickhouseClient:
             rows_count += table_data["rows"]
         return rows_count, user_data
 
+    def get_all_part_checksums(self) -> list:
+        """
+        Retrieve checksums of files of all active data parts.
+        """
+        query = f"""
+            SELECT database, table, name,
+                   hash_of_all_files,
+                   hash_of_uncompressed_files,
+                   uncompressed_hash_of_compressed_files
+            FROM system.parts
+            WHERE active AND database NOT IN ('system', '_temporary_and_external_tables',
+                                              'information_schema', 'INFORMATION_SCHEMA',
+                                              '{self._system_database}')
+            ORDER BY database, table, name
+            FORMAT JSONCompact
+            """
+        return self._query("POST", data=query.encode("utf-8"))["data"]
+
     def get_table_schemas(self) -> dict:
         """
         Retrieve DDL for user schemas.

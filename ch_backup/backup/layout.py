@@ -41,6 +41,7 @@ BACKUP_LIGHT_META_FNAME = "backup_light_struct.json"
 ACCESS_CONTROL_FNAME = "access_control.tar"
 DATABASES_FNAME = "databases.tar"
 COMPRESSED_EXTENSION = ".gz"
+CLOUD_STORAGE_EXCLUDE_FILE_NAMES = ["frozen_metadata.txt"]
 
 
 # pylint: disable=too-many-public-methods
@@ -248,15 +249,35 @@ class BackupLayout:
             msg = f"Failed to create async upload of {remote_path}"
             raise StorageError(msg) from e
 
+    def has_frozen_cloud_storage_data(
+        self, backup_meta: BackupMetadata, disk: Disk, table: Table
+    ) -> bool:
+        """
+        Return True if table data is frozen on a given cloud storage disk.
+        """
+        assert table.path_on_disk, f"Table {table} doesn't store data on disk"
+
+        shadow_path = _table_shadow_path(
+            disk.path, backup_meta.get_sanitized_name(), table.path_on_disk
+        )
+        return not dir_is_empty(shadow_path, CLOUD_STORAGE_EXCLUDE_FILE_NAMES)
+
+    # pylint: disable=too-many-positional-arguments
     def upload_cloud_storage_metadata(
         self,
         backup_meta: BackupMetadata,
         disk: Disk,
         table: Table,
         delete_after_upload: bool = False,
+        source_disk: Optional[Disk] = None,
     ) -> bool:
         """
         Upload specified disk metadata files from given directory path as a tarball.
+
+        Metadata files are read from source_disk when it is set. That is the case
+        when cloud storage data is copied into the backup: metadata referring to
+        the copies is written by ClickHouse to a temporary disk.
+
         Returns: whether backed up disk had data.
         """
         assert table.path_on_disk, f"Table {table} doesn't store data on disk"
@@ -270,9 +291,10 @@ class BackupLayout:
             disk.name,
             compression,
         )
-        shadow_path = _table_shadow_path(disk.path, backup_name, table.path_on_disk)
-        exclude_file_names = ["frozen_metadata.txt"]
-        if dir_is_empty(shadow_path, exclude_file_names):
+        shadow_path = _table_shadow_path(
+            (source_disk or disk).path, backup_name, table.path_on_disk
+        )
+        if dir_is_empty(shadow_path, CLOUD_STORAGE_EXCLUDE_FILE_NAMES):
             return False
 
         logging.debug(f'Uploading "{shadow_path}" content to "{remote_path}"')
@@ -282,7 +304,7 @@ class BackupLayout:
                 dir_path=shadow_path,
                 remote_path=remote_path,
                 tar_base_dir=table.path_on_disk,
-                exclude_file_names=exclude_file_names,
+                exclude_file_names=CLOUD_STORAGE_EXCLUDE_FILE_NAMES,
                 is_async=True,
                 encryption=backup_meta.cloud_storage.encrypted,
                 delete=delete_after_upload,

@@ -1,3 +1,5 @@
+import copy
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 from unittest.mock import MagicMock, Mock, patch
@@ -6,8 +8,9 @@ import pytest
 
 from ch_backup.backup.metadata import BackupMetadata, PartMetadata
 from ch_backup.backup_context import BackupContext
-from ch_backup.clickhouse.models import Database, Table
+from ch_backup.clickhouse.models import Database, Disk, Table
 from ch_backup.config import DEFAULT_CONFIG
+from ch_backup.exceptions import ClickhouseBackupError
 from ch_backup.logic.table import TableBackup
 
 UUID = "fa8ff291-1922-4b7f-afa7-06633d5e16ae"
@@ -282,3 +285,209 @@ class TestRestorePreprocessing:
         attached_table = context.ch_ctl.attach_table.call_args.args[0]
         assert attached_table.name == expected_detached_name
         assert result == [backup_table]
+
+
+class TestCloudStorageCopyDataFlag:
+    """
+    Tests that the cloud_storage.copy_data option reaches backup metadata.
+    """
+
+    @staticmethod
+    def _backup_with_cloud_conf(cloud_conf: dict) -> BackupMetadata:
+        """Helper: run a schema-only backup with a given cloud_storage config."""
+        config: dict = copy.deepcopy(DEFAULT_CONFIG)
+        config["cloud_storage"] = cloud_conf
+        context = BackupContext(config)  # type: ignore[arg-type]
+        context.ch_ctl = MagicMock()
+        context.ch_config = MagicMock()
+        context.ch_config.config = {}
+        context.backup_meta = BackupMetadata(
+            name="20181017T210300",
+            path="ch_backup/20181017T210300",
+            version="1.0.100",
+            ch_version="19.1.16",
+            time_format="%Y-%m-%dT%H:%M:%S%Z",
+            hostname="clickhouse01.test_net_711",
+        )
+
+        TableBackup().backup(
+            context,
+            databases=[],
+            db_tables={},
+            schema_only=True,
+            multiprocessing_config={},
+        )
+
+        return context.backup_meta
+
+    def test_flag_is_set_when_copy_data_enabled(self) -> None:
+        """
+        With cloud_storage.copy_data enabled the backup must be marked as
+        containing copied cloud storage data.
+        """
+        backup_meta = self._backup_with_cloud_conf({"copy_data": True})
+
+        assert backup_meta.cloud_storage.data_copied is True
+
+    def test_flag_is_not_set_when_copy_data_disabled(self) -> None:
+        """
+        With cloud_storage.copy_data disabled the backup must keep the default
+        behaviour of storing references only.
+        """
+        backup_meta = self._backup_with_cloud_conf({"copy_data": False})
+
+        assert backup_meta.cloud_storage.data_copied is False
+
+    def test_flag_is_not_set_when_option_is_absent(self) -> None:
+        """
+        A configuration file without the option must behave as if it is disabled.
+        """
+        backup_meta = self._backup_with_cloud_conf({})
+
+        assert backup_meta.cloud_storage.data_copied is False
+
+
+class TestBackupCloudStorageMetadata:
+    """
+    Tests for TableBackup._backup_cloud_storage_metadata.
+    """
+
+    # pylint: disable=protected-access
+
+    @staticmethod
+    def _make_table(disks: List[Disk]) -> Table:
+        return Table(
+            "db1",
+            "table1",
+            "MergeTree",
+            disks,
+            [os.path.join(disk.path, "store/abc/abcdef") for disk in disks],
+            "",
+            "",
+            UUID,
+        )
+
+    @staticmethod
+    def _make_context(
+        has_frozen_data: bool = True,
+    ) -> tuple[BackupContext, MagicMock, MagicMock]:
+        """Helper: build a context with mocked layout and backup metadata."""
+        context = Mock(spec=BackupContext)
+        context.backup_layout = MagicMock()
+        context.backup_layout.has_frozen_cloud_storage_data.return_value = (
+            has_frozen_data
+        )
+        context.backup_layout.upload_cloud_storage_metadata.return_value = True
+        context.backup_meta = MagicMock()
+        return context, context.backup_layout, context.backup_meta.cloud_storage
+
+    def test_metadata_is_uploaded_from_the_disk_itself_without_copying(self):
+        """
+        Without backup disks nothing is copied and metadata is read from the
+        disk holding the frozen data.
+        """
+        disk = Disk("s3", "/var/lib/clickhouse/disks/s3/", "s3")
+        context, layout, cloud_storage = self._make_context()
+
+        TableBackup._backup_cloud_storage_metadata(context, self._make_table([disk]))
+
+        upload_kwargs = layout.upload_cloud_storage_metadata.call_args.kwargs
+        assert upload_kwargs["source_disk"] is None
+        cloud_storage.add_disk.assert_called_once_with("s3")
+
+    def test_data_is_copied_and_metadata_is_read_from_the_backup_disk(self):
+        """
+        With backup disks the data is copied first and metadata of the copies
+        is uploaded instead of the frozen one.
+        """
+        disk = Disk("s3", "/var/lib/clickhouse/disks/s3/", "s3")
+        backup_disk = Disk("s3_backup", "/var/lib/clickhouse/disks/s3_backup/", "s3")
+        backup_disks = MagicMock()
+        backup_disks.copy_table_data.return_value = backup_disk
+        context, layout, cloud_storage = self._make_context()
+        table = self._make_table([disk])
+
+        TableBackup._backup_cloud_storage_metadata(context, table, backup_disks)
+
+        backup_disks.copy_table_data.assert_called_once_with("s3", table)
+        upload_kwargs = layout.upload_cloud_storage_metadata.call_args.kwargs
+        assert upload_kwargs["source_disk"] is backup_disk
+        cloud_storage.add_disk.assert_called_once_with("s3")
+
+    def test_nothing_is_copied_when_no_data_is_frozen(self):
+        """
+        Copying an empty shadow directory would fail, so the check must happen
+        before the copy.
+        """
+        disk = Disk("s3", "/var/lib/clickhouse/disks/s3/", "s3")
+        backup_disks = MagicMock()
+        context, layout, cloud_storage = self._make_context(has_frozen_data=False)
+
+        TableBackup._backup_cloud_storage_metadata(
+            context, self._make_table([disk]), backup_disks
+        )
+
+        backup_disks.copy_table_data.assert_not_called()
+        layout.upload_cloud_storage_metadata.assert_not_called()
+        cloud_storage.add_disk.assert_not_called()
+
+    def test_failed_copy_is_not_silently_ignored(self):
+        """
+        clickhouse-disks reports copy errors with a zero exit code, so a copy
+        that produced no metadata must fail the backup.
+        """
+        disk = Disk("s3", "/var/lib/clickhouse/disks/s3/", "s3")
+        backup_disks = MagicMock()
+        context, layout, cloud_storage = self._make_context()
+        layout.upload_cloud_storage_metadata.return_value = False
+
+        with pytest.raises(ClickhouseBackupError):
+            TableBackup._backup_cloud_storage_metadata(
+                context, self._make_table([disk]), backup_disks
+            )
+
+        cloud_storage.add_disk.assert_not_called()
+
+    def test_empty_upload_without_copying_is_not_an_error(self):
+        """
+        Without copying an empty result only means there is nothing to store.
+        """
+        disk = Disk("s3", "/var/lib/clickhouse/disks/s3/", "s3")
+        context, layout, cloud_storage = self._make_context()
+        layout.upload_cloud_storage_metadata.return_value = False
+
+        TableBackup._backup_cloud_storage_metadata(context, self._make_table([disk]))
+
+        cloud_storage.add_disk.assert_not_called()
+
+    def test_local_disks_are_skipped(self):
+        """
+        Only cloud storage disks are backed up here.
+        """
+        disk = Disk("default", "/var/lib/clickhouse/", "local")
+        backup_disks = MagicMock()
+        context, layout, _ = self._make_context()
+
+        TableBackup._backup_cloud_storage_metadata(
+            context, self._make_table([disk]), backup_disks
+        )
+
+        backup_disks.copy_table_data.assert_not_called()
+        layout.upload_cloud_storage_metadata.assert_not_called()
+
+    def test_cached_disks_are_skipped(self):
+        """
+        Data of a cached disk is handled through the disk behind the cache.
+        """
+        disk = Disk(
+            "s3", "/var/lib/clickhouse/disks/s3/", "s3", cache_path="/var/cache/s3"
+        )
+        backup_disks = MagicMock()
+        context, layout, _ = self._make_context()
+
+        TableBackup._backup_cloud_storage_metadata(
+            context, self._make_table([disk]), backup_disks
+        )
+
+        backup_disks.copy_table_data.assert_not_called()
+        layout.upload_cloud_storage_metadata.assert_not_called()

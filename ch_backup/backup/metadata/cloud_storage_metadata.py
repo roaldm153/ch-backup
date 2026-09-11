@@ -14,10 +14,12 @@ class CloudStorageMetadata:
         self,
         encryption: bool = True,
         compression: bool = True,
+        data_copied: bool = False,
         disks: Optional[List[str]] = None,
     ) -> None:
         self._encryption: bool = encryption
         self._compression: bool = compression
+        self._data_copied: bool = data_copied
         self._disks: List[str] = disks or []
 
     @property
@@ -55,6 +57,13 @@ class CloudStorageMetadata:
         """
         return self._compression
 
+    @property
+    def data_copied(self) -> bool:
+        """
+        Return True if Cloud Storage data is copied into the backup.
+        """
+        return self._data_copied
+
     def encrypt(self) -> None:
         """
         Encrypt Cloud Storage data within the backup.
@@ -63,9 +72,15 @@ class CloudStorageMetadata:
 
     def compress(self) -> None:
         """
-        Encrypt Cloud Storage data within the backup.
+        Compress Cloud Storage data within the backup.
         """
         self._compression = True
+
+    def copy_data(self) -> None:
+        """
+        Mark that Cloud Storage data is copied into the backup.
+        """
+        self._data_copied = True
 
     @classmethod
     def load(cls, data: Dict[str, Any]) -> "CloudStorageMetadata":
@@ -75,6 +90,7 @@ class CloudStorageMetadata:
         return cls(
             encryption=data.get("encryption", True),
             compression=data.get("compression", False),
+            data_copied=data.get("data_copied", False),
             disks=data.get("disks", []),
         )
 
@@ -85,5 +101,6 @@ class CloudStorageMetadata:
         return {
             "encryption": self._encryption,
             "compression": self._compression,
+            "data_copied": self._data_copied,
             "disks": self._disks,
         }

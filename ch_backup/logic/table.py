@@ -6,6 +6,7 @@ Clickhouse backup logic for tables
 
 import os
 from collections import deque
+from contextlib import ExitStack
 from dataclasses import dataclass
 from functools import partial
 from itertools import chain
@@ -20,7 +21,7 @@ from ch_backup.backup.metadata import PartMetadata, TableMetadata
 from ch_backup.backup.restore_context import PartState
 from ch_backup.backup_context import BackupContext
 from ch_backup.clickhouse.client import ClickhouseError
-from ch_backup.clickhouse.disks import ClickHouseTemporaryDisks
+from ch_backup.clickhouse.disks import ClickHouseBackupDisks, ClickHouseTemporaryDisks
 from ch_backup.clickhouse.metadata_cleaner import MetadataCleaner
 from ch_backup.clickhouse.models import Database, FrozenPart, Table
 from ch_backup.clickhouse.schema import (
@@ -76,6 +77,9 @@ class TableBackup(BackupManager):
         if context.cloud_conf.get("cloud_storage", {}).get("compression", True):
             logging.debug('Cloud Storage "shadow" backup will be compressed')
             context.backup_meta.cloud_storage.compress()
+        if context.cloud_conf.get("copy_data", False):
+            logging.debug("Cloud Storage data will be copied into the backup")
+            context.backup_meta.cloud_storage.copy_data()
 
         # Since https://github.com/ClickHouse/ClickHouse/pull/75016
         if (
@@ -93,16 +97,29 @@ class TableBackup(BackupManager):
             context, databases, db_tables
         )
 
-        for db in databases:
-            self._backup(
-                context,
-                db,
-                db_tables[db.name],
-                backup_name,
-                schema_only,
-                multiprocessing_config,
-                change_times,
-            )
+        with ExitStack() as stack:
+            backup_disks = None
+            if context.backup_meta.cloud_storage.data_copied:
+                backup_disks = stack.enter_context(
+                    ClickHouseBackupDisks(
+                        context.ch_ctl,
+                        context.config_root,
+                        context.backup_meta,
+                        context.ch_config,
+                    )
+                )
+
+            for db in databases:
+                self._backup(
+                    context,
+                    db,
+                    db_tables[db.name],
+                    backup_name,
+                    schema_only,
+                    multiprocessing_config,
+                    change_times,
+                    backup_disks,
+                )
 
     def _collect_local_metadata_change_times(
         self,
@@ -143,6 +160,7 @@ class TableBackup(BackupManager):
         schema_only: bool,
         multiprocessing_config: Dict,
         change_times: Dict[Table, TableMetadataChangeTime],
+        backup_disks: Optional[ClickHouseBackupDisks] = None,
     ) -> None:
         """
         Backup single database tables.
@@ -207,7 +225,7 @@ class TableBackup(BackupManager):
                                         backup_name,
                                     )
                                     self._backup_cloud_storage_metadata(
-                                        context, freezed_table
+                                        context, freezed_table, backup_disks
                                     )
             finally:
                 if create_statements_to_backup:
@@ -300,9 +318,16 @@ class TableBackup(BackupManager):
             return None
 
     @staticmethod
-    def _backup_cloud_storage_metadata(context: BackupContext, table: Table) -> None:
+    def _backup_cloud_storage_metadata(
+        context: BackupContext,
+        table: Table,
+        backup_disks: Optional[ClickHouseBackupDisks] = None,
+    ) -> None:
         """
         Backup cloud storage metadata files.
+
+        When backup_disks is set, disk data is also copied into the backup and
+        metadata referring to the copies is uploaded instead of the frozen one.
         """
         logging.debug(
             'Backing up Cloud Storage disks "shadow" directory of "{}"."{}"',
@@ -310,13 +335,29 @@ class TableBackup(BackupManager):
             table.name,
         )
         for _, disk in table.paths_with_disks:
-            if disk.type == "s3" and not disk.cache_path:
-                if not context.backup_layout.upload_cloud_storage_metadata(
-                    context.backup_meta, disk, table
-                ):
-                    logging.debug(f'No data frozen on disk "{disk.name}", skipping')
-                    continue
+            if disk.type != "s3" or disk.cache_path:
+                continue
+
+            if not context.backup_layout.has_frozen_cloud_storage_data(
+                context.backup_meta, disk, table
+            ):
+                logging.debug(f'No data frozen on disk "{disk.name}", skipping')
+                continue
+
+            source_disk = (
+                backup_disks.copy_table_data(disk.name, table) if backup_disks else None
+            )
+            if context.backup_layout.upload_cloud_storage_metadata(
+                context.backup_meta, disk, table, source_disk=source_disk
+            ):
                 context.backup_meta.cloud_storage.add_disk(disk.name)
+            elif source_disk:
+                # clickhouse-disks reports copy errors with a zero exit code,
+                # so an empty result is the only sign that the copy has failed
+                raise ClickhouseBackupError(
+                    f'Copying data of disk "{disk.name}" of table '
+                    f"`{table.database}`.`{table.name}` produced no metadata"
+                )
 
     # pylint: disable=too-many-arguments,too-many-locals,too-many-positional-arguments
     def restore(
