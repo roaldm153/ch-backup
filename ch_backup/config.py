@@ -131,6 +131,8 @@ DEFAULT_CONFIG = {
     },
     # Same structure as 'storage' section, but for cloud storage
     "cloud_storage": {
+        # Encryption and compression are applied to cloud storage metadata only.
+        # Data copied by "copy_data" is stored as ClickHouse wrote it.
         "encryption": True,
         "compression": True,
         "copy_data": False,

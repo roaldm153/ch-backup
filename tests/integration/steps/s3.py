@@ -53,6 +53,17 @@ def step_cloud_storage_bucket_contains_prefix(context, bucket, prefix):
     )
 
 
+@then('s3 bucket {bucket} contains no objects with prefix "{prefix}"')
+def step_cloud_storage_bucket_has_no_prefix(context, bucket, prefix):
+    s3_client = s3.S3Client(context, bucket)
+    objects = s3_client.list_objects(prefix)
+    assert_that(
+        objects,
+        equal_to([]),
+        f"Unexpected objects with prefix {prefix} in bucket {bucket}: {objects}",
+    )
+
+
 @when("we delete all objects in s3 bucket {bucket}")
 def step_delete_all_objects_in_bucket(context, bucket):
     s3_client = s3.S3Client(context, bucket)

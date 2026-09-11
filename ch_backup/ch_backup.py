@@ -515,6 +515,7 @@ class ClickhouseBackup:
                         backup, table, db_dedup_references[table.name]
                     )
 
+            self._context.backup_layout.delete_cloud_storage_data(backup.name)
             self._context.ch_ctl.system_unfreeze(backup.name)
             return (
                 None,

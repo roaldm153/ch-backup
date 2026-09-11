@@ -5,23 +5,41 @@ Clickhouse-disks controls temporary cloud storage disks management.
 import copy
 import os
 import shutil
+from contextlib import contextmanager
 from functools import partial
 from subprocess import PIPE, Popen
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Type
+from typing import (
+    IO,
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+)
 from urllib.parse import urlparse
 
 import xmltodict
 
 from ch_backup import logging
-from ch_backup.backup.layout import BackupLayout
-from ch_backup.backup.metadata import BackupMetadata, PartMetadata
+from ch_backup.backup.layout import CLOUD_STORAGE_DATA_DIR, BackupLayout
+from ch_backup.backup.metadata import (
+    BackupMetadata,
+    PartMetadata,
+    sanitize_backup_name,
+)
 from ch_backup.backup.metadata.table_metadata import TableMetadata
 from ch_backup.clickhouse.config import ClickhouseConfig
 from ch_backup.clickhouse.control import ClickhouseCTL
 from ch_backup.clickhouse.models import Disk, Table
 from ch_backup.config import Config
 from ch_backup.storage.async_pipeline.base_pipeline.exec_pool import ThreadExecPool
+from ch_backup.storage.engine.s3.s3_client_factory import resolve_proxy_host
 from ch_backup.util import is_equal_s3_endpoints
 
 
@@ -61,7 +79,7 @@ class ClickHouseTemporaryDisks:
         self._backup_layout = backup_layout
         self._config = config["backup"]
         self._config_dir = config["clickhouse"]["config_dir"]
-        self._credentials = config["storage"]["credentials"]
+        self._storage_config = config["storage"]
         self._backup_meta = backup_meta
         self._ch_config = ch_config
         self._use_local_copy = use_local_copy
@@ -111,12 +129,12 @@ class ClickHouseTemporaryDisks:
 
         for disk in self._created_disks.values():
             logging.debug(f"Removing tmp disk {disk.name}")
-            try:
-                os.remove(_get_config_path(self._config_dir, disk.name))
-                self._disks.pop(disk.name)
-                return True
-            except FileNotFoundError:
-                pass
+            _remove_file(_get_config_path(self._config_dir, disk.name))
+            self._disks.pop(disk.name, None)
+        if self._created_disks:
+            self._ch_ctl.reload_config()
+        self._created_disks.clear()
+        _remove_file(CH_DISK_CONFIG_PATH)
         return True
 
     def _create_temporary_disk(
@@ -149,17 +167,8 @@ class ClickHouseTemporaryDisks:
 
         disks_config = {tmp_disk_name: disk_config}
 
-        request_timeout_ms = int(disk_config.get("request_timeout_ms", 0))
-        if request_timeout_ms < CH_OBJECT_STORAGE_REQUEST_TIMEOUT_MS:
-            disks_config[tmp_disk_name]["request_timeout_ms"] = str(
-                CH_OBJECT_STORAGE_REQUEST_TIMEOUT_MS
-            )
-            disks_config[disk_name] = {
-                "request_timeout_ms": {
-                    "@replace": "replace",
-                    "#text": str(CH_OBJECT_STORAGE_REQUEST_TIMEOUT_MS),
-                }
-            }
+        if _raise_request_timeout(disk_config):
+            disks_config[disk_name] = _request_timeout_override()
             if self._disks:
                 self._disks[disk_name]["request_timeout_ms"] = str(
                     CH_OBJECT_STORAGE_REQUEST_TIMEOUT_MS
@@ -193,14 +202,13 @@ class ClickHouseTemporaryDisks:
         from the bucket of the source ClickHouse installation.
         """
         if self._backup_meta.cloud_storage.data_copied:
-            disk_config["endpoint"] = _backup_disk_endpoint(
-                self._credentials,
+            _set_backup_storage(
+                disk_config,
+                self._storage_config,
                 self._config["path_root"],
                 self._backup_meta,
                 disk_name,
             )
-            disk_config["access_key_id"] = self._credentials["access_key_id"]
-            disk_config["secret_access_key"] = self._credentials["secret_access_key"]
             return
 
         endpoint = urlparse(disk_config["endpoint"])
@@ -331,7 +339,7 @@ class ClickHouseBackupDisks:
         self._ch_ctl = ch_ctl
         self._config_dir = config["clickhouse"]["config_dir"]
         self._path_root = config["backup"]["path_root"]
-        self._credentials = config["storage"]["credentials"]
+        self._storage_config = config["storage"]
         self._backup_meta = backup_meta
         self._ch_config = ch_config
 
@@ -356,15 +364,21 @@ class ClickHouseBackupDisks:
         """
         Remove configuration files and local metadata of the created disks.
         """
+        if exc_type is not None:
+            logging.warning(
+                f'Omitting backup cloud storage disk cleanup due to exception: "{exc_type.__name__}: {value}"'
+            )
+            return
+
         for disk_name, disk in self._created_disks.items():
             logging.debug(f"Removing tmp disk {disk_name}")
-            try:
-                os.remove(_get_config_path(self._config_dir, disk_name))
-            except FileNotFoundError:
-                pass
+            _remove_file(_get_config_path(self._config_dir, disk_name))
             shutil.rmtree(os.path.join(disk.path, "shadow"), ignore_errors=True)
             self._disks.pop(disk_name, None)
+        if self._created_disks:
+            self._ch_ctl.reload_config()
         self._created_disks.clear()
+        _remove_file(CH_DISK_CONFIG_PATH)
 
     def create_disk(self, disk_name: str) -> Disk:
         """
@@ -383,16 +397,25 @@ class ClickHouseBackupDisks:
 
         logging.debug(f"Creating tmp disk {tmp_disk_name}")
         disk_config = copy.copy(self._disks[disk_name])
-        disk_config["endpoint"] = _backup_disk_endpoint(
-            self._credentials, self._path_root, self._backup_meta, disk_name
+        _set_backup_storage(
+            disk_config,
+            self._storage_config,
+            self._path_root,
+            self._backup_meta,
+            disk_name,
         )
-        disk_config["access_key_id"] = self._credentials["access_key_id"]
-        disk_config["secret_access_key"] = self._credentials["secret_access_key"]
-        disk_config["request_timeout_ms"] = str(CH_OBJECT_STORAGE_REQUEST_TIMEOUT_MS)
+
+        disks_config = {tmp_disk_name: disk_config}
+        # Both sides of the copy must tolerate slow object storage requests.
+        if _raise_request_timeout(disk_config):
+            disks_config[disk_name] = _request_timeout_override()
+            self._disks[disk_name]["request_timeout_ms"] = str(
+                CH_OBJECT_STORAGE_REQUEST_TIMEOUT_MS
+            )
 
         _render_disks_config(
             _get_config_path(self._config_dir, tmp_disk_name),
-            {tmp_disk_name: disk_config},
+            disks_config,
         )
         self._ch_ctl.reload_config()
 
@@ -433,24 +456,122 @@ class ClickHouseBackupDisks:
         return backup_disk
 
 
+# pylint: disable=too-many-positional-arguments
+def _set_backup_storage(
+    disk_config: Dict,
+    storage_config: Dict,
+    path_root: str,
+    backup_meta: BackupMetadata,
+    disk_name: str,
+) -> None:
+    """
+    Point a disk configuration to the location of a disk data in the backup.
+
+    The same location is used when the data is copied into the backup and when it
+    is read back, so the two can not drift apart.
+    """
+    credentials = storage_config["credentials"]
+    disk_config["endpoint"] = _backup_disk_endpoint(
+        storage_config, path_root, backup_meta, disk_name
+    )
+    disk_config["access_key_id"] = credentials["access_key_id"]
+    disk_config["secret_access_key"] = credentials["secret_access_key"]
+
+    proxy_uri = _backup_storage_proxy_uri(storage_config)
+    if proxy_uri:
+        disk_config["proxy"] = {"uri": proxy_uri}
+
+
 def _backup_disk_endpoint(
-    credentials: Dict, path_root: str, backup_meta: BackupMetadata, disk_name: str
+    storage_config: Dict, path_root: str, backup_meta: BackupMetadata, disk_name: str
 ) -> str:
     """
     Build the backup bucket URL where data of a given disk is stored.
     """
+    credentials = storage_config["credentials"]
+    bucket = credentials["bucket"]
     prefix = "/".join(
         part.strip("/")
         for part in (
-            credentials["bucket"],
             path_root,
-            backup_meta.get_sanitized_name(),
-            "cloud_storage",
+            sanitize_backup_name(backup_meta.name),
+            CLOUD_STORAGE_DATA_DIR,
             disk_name,
         )
         if part
     )
-    return f"{credentials['endpoint_url'].rstrip('/')}/{prefix}/"
+    endpoint_url = credentials["endpoint_url"].rstrip("/")
+
+    # "auto" is left path-style: it is the only style verified against the
+    # object storages ch-backup is used with.
+    if storage_config["boto_config"]["addressing_style"] == "virtual":
+        scheme, _, host_and_path = endpoint_url.partition("://")
+        return f"{scheme}://{bucket}.{host_and_path}/{prefix}/"
+
+    return f"{endpoint_url}/{bucket}/{prefix}/"
+
+
+def _backup_storage_proxy_uri(storage_config: Dict) -> Optional[str]:
+    """
+    Resolve the proxy ch-backup uses to reach the backup storage, if any.
+    """
+    proxy_resolver = storage_config.get("proxy_resolver", {})
+    resolver_uri = proxy_resolver.get("uri")
+    if not resolver_uri:
+        return None
+
+    host = resolve_proxy_host(resolver_uri)
+    return f"http://{host}:{proxy_resolver['proxy_port']}"
+
+
+def _raise_request_timeout(disk_config: Dict) -> bool:
+    """
+    Raise request timeout of a disk configuration, keeping a larger one intact.
+
+    Returns whether the timeout was raised.
+    """
+    if int(disk_config.get("request_timeout_ms", 0)) >= (
+        CH_OBJECT_STORAGE_REQUEST_TIMEOUT_MS
+    ):
+        return False
+
+    disk_config["request_timeout_ms"] = str(CH_OBJECT_STORAGE_REQUEST_TIMEOUT_MS)
+    return True
+
+
+def _request_timeout_override() -> Dict:
+    """
+    Build a configuration that raises request timeout of an already defined disk.
+    """
+    return {
+        "request_timeout_ms": {
+            "@replace": "replace",
+            "#text": str(CH_OBJECT_STORAGE_REQUEST_TIMEOUT_MS),
+        }
+    }
+
+
+def _remove_file(path: str) -> None:
+    """
+    Remove a file, ignoring a missing one.
+    """
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+@contextmanager
+def _open_config_file(path: str) -> Iterator[IO[str]]:
+    """
+    Open a config file for writing, readable by its owner only.
+
+    Disk configurations contain object storage credentials.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        yield f
 
 
 def _render_disks_config(
@@ -463,7 +584,7 @@ def _render_disks_config(
     if history_file is not None:
         config["history-file"] = history_file
 
-    with open(path, "w", encoding="utf-8") as f:
+    with _open_config_file(path) as f:
         xmltodict.unparse(
             {"clickhouse": config},
             f,

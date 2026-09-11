@@ -55,6 +55,34 @@ Feature: Full backup of cloud storage data
     And data part checksums equal to saved ones on clickhouse02
 
   @object_storage_copy
+  @require_version_24.1
+  Scenario: Deleting a backup deletes copied cloud storage data
+    Given we have executed queries on clickhouse01
+    """
+    CREATE DATABASE IF NOT EXISTS test_db;
+    CREATE TABLE test_db.table_s3 (
+        CounterID UInt32,
+        UserID    UInt32
+    )
+    ENGINE = MergeTree()
+    ORDER BY UserID
+    SETTINGS storage_policy = 's3';
+
+    INSERT INTO test_db.table_s3 SELECT 0, number FROM system.numbers LIMIT 100;
+    """
+    # ClickHouse writes cloud storage data under a name with '-' replaced by '_',
+    # so a dashed name is the case where deletion can miss the data.
+    When we create clickhouse01 clickhouse backup
+    """
+    name: test-backup
+    copy_cloud_storage_data: true
+    """
+    Then s3 bucket ch-backup contains objects with prefix "ch_backup/test_backup/cloud_storage/s3/"
+    When we delete clickhouse01 clickhouse backup #0
+    Then s3 bucket ch-backup contains no objects with prefix "ch_backup/test_backup/"
+    And s3 bucket ch-backup contains no objects with prefix "ch_backup/test-backup/"
+
+  @object_storage_copy
   @require_version_22.8
   Scenario: Restore without copied data still requires the source bucket
     Given we have executed queries on clickhouse01

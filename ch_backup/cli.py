@@ -370,7 +370,9 @@ def show_command(
         "--copy-cloud-storage-data",
         is_flag=True,
         help="Copy object storage data into the backup instead of storing "
-        "references only. Increases backup size and duration.",
+        "references only. Increases backup size and duration. The data is copied "
+        "by ClickHouse as is: unlike the metadata, it is neither compressed nor "
+        "encrypted by ch-backup.",
     ),
 )
 @option_group(

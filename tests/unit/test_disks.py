@@ -3,17 +3,19 @@ Unit tests disks module.
 """
 
 import copy
+import io
 import os
 import unittest
 import unittest.mock
 from contextlib import contextmanager
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import IO, Dict, Iterator, List, Optional, Tuple
 
 import xmltodict
 
 from ch_backup.backup_context import BackupContext
 from ch_backup.clickhouse.config import ClickhouseConfig
 from ch_backup.clickhouse.disks import (
+    CH_DISK_CONFIG_PATH,
     ClickHouseBackupDisks,
     ClickHouseDisksException,
     ClickHouseTemporaryDisks,
@@ -21,8 +23,6 @@ from ch_backup.clickhouse.disks import (
 from ch_backup.clickhouse.models import Disk, Table
 from ch_backup.config import DEFAULT_CONFIG, Config
 from tests.unit.utils import assert_equal, parametrize
-
-write_result = ""
 
 
 @parametrize(
@@ -172,23 +172,18 @@ def test_temporary_disk(clickhouse_config, disk_name, source, temp_config):
         with unittest.mock.patch("yaml.load", return_value=""):
             context.ch_config = ClickhouseConfig(Config("foo"))
         context.ch_config.load()
-    with unittest.mock.patch("builtins.open", new=unittest.mock.mock_open()) as m:
-        disk = ClickHouseTemporaryDisks(
-            context.ch_ctl,
-            context.backup_layout,
-            context.config_root,
-            context.backup_meta,
-            source["bucket"],
-            source["path"],
-            source["endpoint"],
-            context.ch_config,
-        )
+    disk = ClickHouseTemporaryDisks(
+        context.ch_ctl,
+        context.backup_layout,
+        context.config_root,
+        context.backup_meta,
+        source["bucket"],
+        source["path"],
+        source["endpoint"],
+        context.ch_config,
+    )
 
-        # pylint: disable=global-statement
-        global write_result
-        write_result = ""
-        m().write = write_collector
-
+    with _capture_config_files() as (written, _):
         # pylint: disable=protected-access
         # Initialise _disks the same way __enter__ does
         disk._disks = (context.ch_config.config.get("storage_configuration") or {}).get(
@@ -198,21 +193,13 @@ def test_temporary_disk(clickhouse_config, disk_name, source, temp_config):
             context.backup_meta,
             disk_name,
         )
-        m.assert_called_with(
-            f"/etc/clickhouse-server/config.d/cloud_storage_tmp_disk_{disk_name}_source.xml",
-            "w",
-            encoding="utf-8",
-        )
 
-        expected_content = xmltodict.parse(temp_config, disable_entities=False)
-        actual_content = xmltodict.parse(write_result, disable_entities=False)
-        assert_equal(actual_content, expected_content)
-
-
-def write_collector(x):
-    # pylint: disable=global-statement
-    global write_result
-    write_result += x.decode("utf-8")
+    config_path = (
+        f"/etc/clickhouse-server/config.d/cloud_storage_tmp_disk_{disk_name}_source.xml"
+    )
+    expected_content = xmltodict.parse(temp_config, disable_entities=False)
+    actual_content = xmltodict.parse(written[config_path], disable_entities=False)
+    assert_equal(actual_content, expected_content)
 
 
 BACKUP_STORAGE_CREDENTIALS = {
@@ -245,6 +232,7 @@ def _make_temporary_disks(
     context.backup_meta.cloud_storage.disks = cloud_storage_disks or []
     context.backup_meta.cloud_storage.enabled = bool(cloud_storage_disks)
     context.backup_meta.cloud_storage.data_copied = data_copied
+    context.backup_meta.name = "20260101T000000"
     context.backup_meta.get_sanitized_name.return_value = "20260101T000000"
     with unittest.mock.patch(
         "builtins.open",
@@ -280,16 +268,14 @@ def test_enter_without_storage_configuration():
     """
     disk_manager = _make_temporary_disks(clickhouse_config_xml, cloud_storage_disks=[])
 
-    # pylint: disable=global-statement
-    global write_result
-    write_result = ""
-    with unittest.mock.patch("builtins.open", new=unittest.mock.mock_open()) as m:
-        m().write = write_collector
+    with _capture_config_files() as (written, _):
         with disk_manager:
             # pylint: disable=protected-access
             assert disk_manager._disks == {}
 
-    actual_content = xmltodict.parse(write_result, disable_entities=False)
+    actual_content = xmltodict.parse(
+        written[CH_DISK_CONFIG_PATH], disable_entities=False
+    )
     assert_equal(
         actual_content["clickhouse"]["history-file"],
         "/tmp/.disks-file-history",
@@ -359,14 +345,18 @@ BACKUP_DISK_CONFIG_PATH = (
 
 def _make_backup_disks(
     clickhouse_config_xml: str,
+    storage_config: Optional[dict] = None,
 ) -> Tuple[ClickHouseBackupDisks, unittest.mock.MagicMock]:
     """Helper: build ClickHouseBackupDisks with mocked dependencies."""
-    context = BackupContext(_make_backup_storage_config())  # type: ignore[arg-type]
+    config = _make_backup_storage_config()
+    config["storage"].update(storage_config or {})
+    context = BackupContext(config)  # type: ignore[arg-type]
     context.ch_ctl = unittest.mock.MagicMock()
     context.ch_ctl.get_disk.return_value = Disk(
         "object_storage_backup", BACKUP_DISK_PATH, "s3"
     )
     context.backup_meta = unittest.mock.MagicMock()
+    context.backup_meta.name = "20260101T000000"
     context.backup_meta.get_sanitized_name.return_value = "20260101T000000"
     with unittest.mock.patch(
         "builtins.open",
@@ -386,17 +376,25 @@ def _make_backup_disks(
 
 
 @contextmanager
-def _capture_written_configs() -> Iterator[Dict[str, str]]:
-    """Helper: collect content of rendered config files, keyed by file path."""
+def _capture_config_files() -> Iterator[Tuple[Dict[str, str], unittest.mock.MagicMock]]:
+    """
+    Helper: collect content of rendered config files and calls removing them.
+
+    Keeps unit tests off the filesystem, which the disks module writes to directly.
+    """
     written: Dict[str, str] = {}
-    with unittest.mock.patch("builtins.open", new=unittest.mock.mock_open()) as m:
 
-        def collect(data: bytes) -> None:
-            path = m.call_args.args[0]
-            written[path] = written.get(path, "") + data.decode("utf-8")
+    @contextmanager
+    def collect(path: str) -> Iterator[IO[str]]:
+        buffer = io.StringIO()
+        yield buffer
+        written[path] = written.get(path, "") + buffer.getvalue()
 
-        m().write = collect
-        yield written
+    with unittest.mock.patch(
+        "ch_backup.clickhouse.disks._open_config_file", new=collect
+    ):
+        with unittest.mock.patch("os.remove") as remove_mock:
+            yield written, remove_mock
 
 
 def test_backup_disk_config():
@@ -417,12 +415,15 @@ def test_backup_disk_config():
                         <secret_access_key>BackupSecretKey</secret_access_key>
                         <request_timeout_ms>3600000</request_timeout_ms>
                     </object_storage_backup>
+                    <object_storage>
+                        <request_timeout_ms replace="replace">3600000</request_timeout_ms>
+                    </object_storage>
                 </disks>
             </storage_configuration>
         </clickhouse>
     """
 
-    with _capture_written_configs() as written:
+    with _capture_config_files() as (written, _):
         with disk_manager:
             disk_manager.create_disk("object_storage")
 
@@ -432,6 +433,80 @@ def test_backup_disk_config():
     )
 
 
+def _created_disk_config(
+    storage_config: dict,
+) -> dict:
+    """Helper: build a backup disk and return its rendered configuration."""
+    disk_manager, _ = _make_backup_disks(
+        BACKUP_DISK_CLICKHOUSE_CONFIG, storage_config=storage_config
+    )
+    with _capture_config_files() as (written, _):
+        with disk_manager:
+            disk_manager.create_disk("object_storage")
+
+    return xmltodict.parse(written[BACKUP_DISK_CONFIG_PATH], disable_entities=False)[
+        "clickhouse"
+    ]["storage_configuration"]["disks"]["object_storage_backup"]
+
+
+def test_backup_disk_endpoint_follows_virtual_addressing_style():
+    """
+    With virtual addressing the bucket is a part of the host name, addressing it
+    as a path would not resolve.
+    """
+    disk_config = _created_disk_config(
+        {"boto_config": {"addressing_style": "virtual", "region_name": "us-east-1"}}
+    )
+
+    assert_equal(
+        disk_config["endpoint"],
+        "https://backup-bucket.minio:9000/ch_backup/20260101T000000/cloud_storage/object_storage/",
+    )
+
+
+def test_backup_disk_uses_the_proxy_of_the_backup_storage():
+    """
+    ClickHouse must reach the backup storage the same way ch-backup does.
+    """
+    with unittest.mock.patch(
+        "ch_backup.clickhouse.disks.resolve_proxy_host", return_value="proxy-host"
+    ):
+        disk_config = _created_disk_config(
+            {"proxy_resolver": {"uri": "http://resolver/", "proxy_port": 8080}}
+        )
+
+    assert_equal(disk_config["proxy"], {"uri": "http://proxy-host:8080"})
+
+
+def test_backup_disk_has_no_proxy_without_a_resolver():
+    """
+    Proxy is optional, an unset resolver must not end up in the configuration.
+    """
+    assert "proxy" not in _created_disk_config({})
+
+
+def test_backup_disk_keeps_a_larger_request_timeout():
+    """
+    A timeout configured by the user must not be lowered.
+    """
+    clickhouse_config = BACKUP_DISK_CLICKHOUSE_CONFIG.replace(
+        "</object_storage>",
+        "<request_timeout_ms>7200000</request_timeout_ms></object_storage>",
+    )
+    disk_manager, _ = _make_backup_disks(clickhouse_config)
+
+    with _capture_config_files() as (written, _):
+        with disk_manager:
+            disk_manager.create_disk("object_storage")
+
+    disks = xmltodict.parse(written[BACKUP_DISK_CONFIG_PATH], disable_entities=False)[
+        "clickhouse"
+    ]["storage_configuration"]["disks"]
+
+    assert_equal(disks["object_storage_backup"]["request_timeout_ms"], "7200000")
+    assert "object_storage" not in disks
+
+
 def test_backup_disk_is_added_to_clickhouse_disks_config():
     """
     The clickhouse-disks utility gets its own config, so it must list both the
@@ -439,7 +514,7 @@ def test_backup_disk_is_added_to_clickhouse_disks_config():
     """
     disk_manager, _ = _make_backup_disks(BACKUP_DISK_CLICKHOUSE_CONFIG)
 
-    with _capture_written_configs() as written:
+    with _capture_config_files() as (written, _):
         with disk_manager:
             disk_manager.create_disk("object_storage")
 
@@ -456,7 +531,7 @@ def test_backup_disk_source_disk_is_not_modified():
     """
     disk_manager, _ = _make_backup_disks(BACKUP_DISK_CLICKHOUSE_CONFIG)
 
-    with _capture_written_configs():
+    with _capture_config_files():
         with disk_manager:
             disk_manager.create_disk("object_storage")
             # pylint: disable=protected-access
@@ -474,14 +549,13 @@ def test_backup_disk_is_created_once():
     """
     disk_manager, ch_ctl = _make_backup_disks(BACKUP_DISK_CLICKHOUSE_CONFIG)
 
-    with _capture_written_configs():
+    with _capture_config_files():
         with disk_manager:
             first = disk_manager.create_disk("object_storage")
             second = disk_manager.create_disk("object_storage")
+            assert ch_ctl.reload_config.call_count == 1
 
     assert first is second
-    # pylint: disable=protected-access
-    assert ch_ctl.reload_config.call_count == 1
 
 
 def test_backup_disk_missing_disk_raises():
@@ -491,7 +565,7 @@ def test_backup_disk_missing_disk_raises():
     """
     disk_manager, _ = _make_backup_disks(BACKUP_DISK_CLICKHOUSE_CONFIG)
 
-    with _capture_written_configs():
+    with _capture_config_files():
         with disk_manager:
             try:
                 disk_manager.create_disk("missing_disk")
@@ -503,23 +577,45 @@ def test_backup_disk_missing_disk_raises():
 
 def test_backup_disk_is_cleaned_up_on_exit():
     """
-    Leaving the context must remove the generated config file and the local
-    metadata written by ClickHouse while copying.
+    Leaving the context must remove the generated config files, tell ClickHouse
+    to forget the disk and drop the local metadata written while copying.
     """
-    disk_manager, _ = _make_backup_disks(BACKUP_DISK_CLICKHOUSE_CONFIG)
+    disk_manager, ch_ctl = _make_backup_disks(BACKUP_DISK_CLICKHOUSE_CONFIG)
 
-    with _capture_written_configs():
-        with unittest.mock.patch("os.remove") as remove_mock:
-            with unittest.mock.patch("shutil.rmtree") as rmtree_mock:
-                with disk_manager:
-                    disk_manager.create_disk("object_storage")
+    with _capture_config_files() as (_, remove_mock):
+        with unittest.mock.patch("shutil.rmtree") as rmtree_mock:
+            with disk_manager:
+                disk_manager.create_disk("object_storage")
 
-    remove_mock.assert_called_once_with(BACKUP_DISK_CONFIG_PATH)
+    assert_equal(
+        [call.args[0] for call in remove_mock.call_args_list],
+        [BACKUP_DISK_CONFIG_PATH, CH_DISK_CONFIG_PATH],
+    )
     rmtree_mock.assert_called_once_with(
         os.path.join(BACKUP_DISK_PATH, "shadow"), ignore_errors=True
     )
+    assert ch_ctl.reload_config.call_count == 2
     # pylint: disable=protected-access
     assert "object_storage_backup" not in disk_manager._disks
+
+
+def test_backup_disk_cleanup_is_omitted_on_error():
+    """
+    Configuration of a failed backup must be left in place for investigation.
+    """
+    disk_manager, _ = _make_backup_disks(BACKUP_DISK_CLICKHOUSE_CONFIG)
+
+    with _capture_config_files() as (_, remove_mock):
+        with unittest.mock.patch("shutil.rmtree") as rmtree_mock:
+            try:
+                with disk_manager:
+                    disk_manager.create_disk("object_storage")
+                    raise ValueError("copy failed")
+            except ValueError:
+                pass
+
+    remove_mock.assert_not_called()
+    rmtree_mock.assert_not_called()
 
 
 def test_copy_table_data_copies_frozen_shadow_directory():
@@ -540,7 +636,7 @@ def test_copy_table_data_copies_frozen_shadow_directory():
         "some-uuid",
     )
 
-    with _capture_written_configs():
+    with _capture_config_files():
         with unittest.mock.patch("ch_backup.clickhouse.disks._exec") as exec_mock:
             with unittest.mock.patch("os.makedirs") as makedirs_mock:
                 with unittest.mock.patch("shutil.rmtree"):
@@ -609,7 +705,7 @@ def test_restore_reads_copied_data_from_the_backup_bucket():
         </clickhouse>
     """
 
-    with _capture_written_configs() as written:
+    with _capture_config_files() as (written, _):
         with disk_manager:
             pass
 
@@ -633,7 +729,7 @@ def test_restore_and_backup_use_the_same_location():
         source_bucket=None,
     )
 
-    with _capture_written_configs():
+    with _capture_config_files():
         with backup_manager:
             backup_manager.create_disk("object_storage")
             # pylint: disable=protected-access

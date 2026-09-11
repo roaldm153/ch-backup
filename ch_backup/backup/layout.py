@@ -25,7 +25,11 @@ from urllib.parse import quote
 from nacl.exceptions import CryptoError
 
 from ch_backup import logging
-from ch_backup.backup.metadata import BackupMetadata, PartMetadata
+from ch_backup.backup.metadata import (
+    BackupMetadata,
+    PartMetadata,
+    sanitize_backup_name,
+)
 from ch_backup.backup.metadata.table_metadata import TableMetadata
 from ch_backup.calculators import calc_encrypted_size, calc_tarball_size
 from ch_backup.clickhouse.models import Database, Disk, FrozenPart, Table
@@ -42,6 +46,9 @@ ACCESS_CONTROL_FNAME = "access_control.tar"
 DATABASES_FNAME = "databases.tar"
 COMPRESSED_EXTENSION = ".gz"
 CLOUD_STORAGE_EXCLUDE_FILE_NAMES = ["frozen_metadata.txt"]
+# Directories of a backup that are addressed by the sanitized backup name.
+CLOUD_STORAGE_METADATA_DIR = "disks"
+CLOUD_STORAGE_DATA_DIR = "cloud_storage"
 
 
 # pylint: disable=too-many-public-methods
@@ -762,7 +769,9 @@ class BackupLayout:
         if self._storage_loader.path_exists(old_style_remote_path):
             return [old_style_remote_path]
 
-        disk_path = os.path.join(backup_path, "disks", source_disk_name)
+        disk_path = os.path.join(
+            backup_path, CLOUD_STORAGE_METADATA_DIR, source_disk_name
+        )
         existing_paths = self._storage_loader.list_dir(
             disk_path, recursive=True, absolute=True
         )
@@ -870,9 +879,35 @@ class BackupLayout:
 
         logging.debug("Deleting data in {}", backup_path)
 
-        deleting_files = self._storage_loader.list_dir(
-            backup_path, recursive=True, absolute=True
+        deleting_files = list(
+            self._storage_loader.list_dir(backup_path, recursive=True, absolute=True)
         )
+        cloud_storage_path = self.get_cloud_storage_path(backup_name)
+        if cloud_storage_path != backup_path:
+            logging.debug("Deleting cloud storage data in {}", cloud_storage_path)
+            deleting_files += self._storage_loader.list_dir(
+                cloud_storage_path, recursive=True, absolute=True
+            )
+        self._delete_files(deleting_files)
+
+    def delete_cloud_storage_data(self, backup_name: str) -> None:
+        """
+        Delete cloud storage metadata and copied data of a backup.
+
+        Cloud storage data is never shared between backups, so it can be deleted
+        even when the rest of the backup is kept.
+        """
+        cloud_storage_path = self.get_cloud_storage_path(backup_name)
+
+        logging.debug("Deleting cloud storage data of backup {}", backup_name)
+
+        deleting_files: List[str] = []
+        for directory in (CLOUD_STORAGE_METADATA_DIR, CLOUD_STORAGE_DATA_DIR):
+            deleting_files += self._storage_loader.list_dir(
+                os.path.join(cloud_storage_path, directory),
+                recursive=True,
+                absolute=True,
+            )
         self._delete_files(deleting_files)
 
     def delete_data_parts(
@@ -924,6 +959,15 @@ class BackupLayout:
         Get backup path by backup name.
         """
         return os.path.join(self._config["path_root"], backup_name)
+
+    def get_cloud_storage_path(self, backup_name: str) -> str:
+        """
+        Get path of cloud storage data of a backup.
+
+        Cloud storage data is addressed by the sanitized backup name, since it is
+        written by ClickHouse itself.
+        """
+        return self.get_backup_path(sanitize_backup_name(backup_name))
 
     def _delete_files(self, remote_paths: Sequence[str]) -> None:
         """
@@ -1060,12 +1104,14 @@ def _disk_metadata_path(
         assert table_name and db_name
         return os.path.join(
             backup_path,
-            "disks",
+            CLOUD_STORAGE_METADATA_DIR,
             disk_name,
             _quote(db_name),
             f"{_quote(table_name)}{extension}",
         )
-    return os.path.join(backup_path, "disks", f"{disk_name}{extension}")
+    return os.path.join(
+        backup_path, CLOUD_STORAGE_METADATA_DIR, f"{disk_name}{extension}"
+    )
 
 
 def _table_shadow_path(

@@ -155,3 +155,65 @@ class TestCloudStorageMetadataUpload:
         assert call["dir_path"] == (
             f"/var/lib/clickhouse/disks/s3/shadow/{self._BACKUP_NAME}/store/abc/abcdef"
         )
+
+
+class TestCloudStorageDataDeletion:
+    """Tests for deletion of cloud storage data of a backup."""
+
+    # pylint: disable=protected-access
+
+    @staticmethod
+    def _make_layout() -> tuple[BackupLayout, MagicMock]:
+        """Helper: build a BackupLayout that records paths passed for deletion."""
+        with (
+            patch("ch_backup.backup.layout.StorageLoader"),
+            patch("ch_backup.backup.layout.get_encryption") as get_encryption,
+        ):
+            get_encryption.return_value.metadata_size.return_value = 0
+            layout = BackupLayout(DEFAULT_CONFIG)  # type: ignore[arg-type]
+        layout._storage_loader = MagicMock()
+        layout._storage_loader.list_dir.side_effect = lambda path, **_kwargs: [
+            f"{path}/object"
+        ]
+        layout._config["path_root"] = "ch_backup"
+        delete_files = MagicMock()
+        setattr(layout, "_delete_files", delete_files)
+        return layout, delete_files
+
+    def test_delete_backup_with_dashed_name_deletes_cloud_storage_data(self):
+        """
+        ClickHouse writes cloud storage data under the sanitized backup name, so
+        deleting the backup path alone would leave the data in the bucket.
+        """
+        layout, delete_files = self._make_layout()
+
+        layout.delete_backup("my-backup")
+
+        assert delete_files.call_args.args[0] == [
+            "ch_backup/my-backup/object",
+            "ch_backup/my_backup/object",
+        ]
+
+    def test_delete_backup_without_dashes_deletes_the_path_once(self):
+        """
+        Both names match, the backup path must not be listed twice.
+        """
+        layout, delete_files = self._make_layout()
+
+        layout.delete_backup("20260101T000000")
+
+        assert delete_files.call_args.args[0] == ["ch_backup/20260101T000000/object"]
+
+    def test_delete_cloud_storage_data_keeps_the_rest_of_the_backup(self):
+        """
+        Partially deleted backup keeps data parts shared with newer backups, but
+        its cloud storage data is never shared and must go.
+        """
+        layout, delete_files = self._make_layout()
+
+        layout.delete_cloud_storage_data("my-backup")
+
+        assert delete_files.call_args.args[0] == [
+            "ch_backup/my_backup/disks/object",
+            "ch_backup/my_backup/cloud_storage/object",
+        ]
