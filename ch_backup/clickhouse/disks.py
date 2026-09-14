@@ -35,7 +35,6 @@ from ch_backup.clickhouse.control import ClickhouseCTL
 from ch_backup.clickhouse.models import Disk, Table
 from ch_backup.config import Config
 from ch_backup.storage.async_pipeline.base_pipeline.exec_pool import ThreadExecPool
-from ch_backup.storage.engine.s3.s3_client_factory import resolve_proxy_host
 from ch_backup.util import (
     is_equal_s3_endpoints,
     s3_uri_from_path_style_to_virtual_hosted,
@@ -466,9 +465,9 @@ def _set_backup_storage(
     disk_config["access_key_id"] = credentials["access_key_id"]
     disk_config["secret_access_key"] = credentials["secret_access_key"]
 
-    proxy_uri = _backup_storage_proxy_uri(storage_config)
-    if proxy_uri:
-        disk_config["proxy"] = {"uri": proxy_uri}
+    proxy = _backup_storage_proxy(storage_config)
+    if proxy:
+        disk_config["proxy"] = proxy
 
 
 def _backup_storage_endpoint(storage_config: Dict, key_prefix: str) -> str:
@@ -488,17 +487,27 @@ def _backup_storage_endpoint(storage_config: Dict, key_prefix: str) -> str:
     return url
 
 
-def _backup_storage_proxy_uri(storage_config: Dict) -> Optional[str]:
+def _backup_storage_proxy(storage_config: Dict) -> Optional[Dict]:
     """
-    Resolve the proxy ch-backup uses to reach the backup storage, if any.
+    Build the proxy configuration for reaching the backup storage, if any.
+
+    ClickHouse is given the resolver rather than an already resolved host, so
+    that it picks a proxy per request the way ch-backup does. A host resolved
+    once would keep being used after it goes down, and ClickHouse retries a
+    failed request far longer than ch-backup waits for the whole copy.
     """
     proxy_resolver = storage_config.get("proxy_resolver", {})
     resolver_uri = proxy_resolver.get("uri")
     if not resolver_uri:
         return None
 
-    host = resolve_proxy_host(resolver_uri)
-    return f"http://{host}:{proxy_resolver['proxy_port']}"
+    return {
+        "resolver": {
+            "endpoint": resolver_uri,
+            "proxy_scheme": "http",
+            "proxy_port": str(proxy_resolver["proxy_port"]),
+        }
+    }
 
 
 def _raise_request_timeout(disk_config: Dict) -> bool:
