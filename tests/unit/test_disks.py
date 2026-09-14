@@ -428,6 +428,7 @@ def test_backup_disk_config():
                         <endpoint>https://minio:9000/backup-bucket/ch_backup/20260101T000000/cloud_storage/object_storage/</endpoint>
                         <access_key_id>BackupAccessKey</access_key_id>
                         <secret_access_key>BackupSecretKey</secret_access_key>
+                        <skip_access_check>true</skip_access_check>
                         <request_timeout_ms>3600000</request_timeout_ms>
                     </object_storage_backup>
                     <object_storage>

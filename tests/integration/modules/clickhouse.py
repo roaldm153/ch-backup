@@ -175,16 +175,22 @@ class ClickhouseClient:
     def get_all_part_checksums(self) -> list:
         """
         Retrieve checksums of files of all active data parts.
+
+        Part names are left out: ATTACH PART assigns new block numbers, so a
+        restored part keeps its contents but not its name.
         """
         query = f"""
-            SELECT database, table, name,
+            SELECT database, table,
                    hash_of_all_files,
                    hash_of_uncompressed_files,
                    uncompressed_hash_of_compressed_files
             FROM system.parts
             WHERE active
               AND database NOT IN ({SYSTEM_DATABASES}, '{self._system_database}')
-            ORDER BY database, table, name
+            ORDER BY database, table,
+                     hash_of_all_files,
+                     hash_of_uncompressed_files,
+                     uncompressed_hash_of_compressed_files
             FORMAT JSONCompact
             """
         return self._query("POST", data=query.encode("utf-8"))["data"]

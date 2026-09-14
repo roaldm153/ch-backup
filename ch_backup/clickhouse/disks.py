@@ -90,6 +90,10 @@ class ClickHouseDiskManager:
     def _backup_disk_config(self, disk_name: str) -> Dict:
         """
         Build a disk configuration pointing to data of a disk in the backup.
+
+        Access check is skipped: it writes to the backup bucket, which is
+        already known to be writable, and ClickHouse retries a failed check
+        far beyond the time ch-backup waits for SYSTEM RELOAD CONFIG.
         """
         disk_config = copy.copy(self._disks[disk_name])
         _set_backup_storage(
@@ -99,6 +103,7 @@ class ClickHouseDiskManager:
                 self._backup_meta.name, disk_name
             ),
         )
+        disk_config["skip_access_check"] = str(True).lower()
         return disk_config
 
     def _register_disk(
