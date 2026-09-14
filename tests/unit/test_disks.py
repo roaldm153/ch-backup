@@ -12,6 +12,7 @@ from typing import IO, Dict, Iterator, List, Optional, Tuple
 
 import xmltodict
 
+from ch_backup.backup.layout import BackupLayout
 from ch_backup.backup_context import BackupContext
 from ch_backup.clickhouse.config import ClickhouseConfig
 from ch_backup.clickhouse.disks import (
@@ -218,20 +219,27 @@ def _make_backup_storage_config() -> dict:
     return config
 
 
-def _make_temporary_disks(
-    clickhouse_config_xml: str,
-    cloud_storage_disks: Optional[List[str]] = None,
-    data_copied: bool = False,
-    source_bucket: Optional[str] = "test-bucket",
-) -> ClickHouseTemporaryDisks:
-    """Helper: build ClickHouseTemporaryDisks with mocked dependencies."""
-    context = BackupContext(_make_backup_storage_config())  # type: ignore[arg-type]
+def _make_backup_layout(config: dict) -> unittest.mock.MagicMock:
+    """Helper: mock a BackupLayout that still builds real backup paths."""
+    with (
+        unittest.mock.patch("ch_backup.backup.layout.StorageLoader"),
+        unittest.mock.patch("ch_backup.backup.layout.get_encryption") as get_encryption,
+    ):
+        get_encryption.return_value.metadata_size.return_value = 0
+        real_layout = BackupLayout(config)  # type: ignore[arg-type]
+
+    layout = unittest.mock.MagicMock()
+    layout.get_cloud_storage_data_path.side_effect = (
+        real_layout.get_cloud_storage_data_path
+    )
+    return layout
+
+
+def _make_context(config: dict, clickhouse_config_xml: str) -> BackupContext:
+    """Helper: build a BackupContext with a loaded ClickHouse configuration."""
+    context = BackupContext(config)  # type: ignore[arg-type]
     context.ch_ctl = unittest.mock.MagicMock()
-    context.backup_layout = unittest.mock.MagicMock()
     context.backup_meta = unittest.mock.MagicMock()
-    context.backup_meta.cloud_storage.disks = cloud_storage_disks or []
-    context.backup_meta.cloud_storage.enabled = bool(cloud_storage_disks)
-    context.backup_meta.cloud_storage.data_copied = data_copied
     context.backup_meta.name = "20260101T000000"
     context.backup_meta.get_sanitized_name.return_value = "20260101T000000"
     with unittest.mock.patch(
@@ -242,6 +250,24 @@ def _make_temporary_disks(
         with unittest.mock.patch("yaml.load", return_value=""):
             context.ch_config = ClickhouseConfig(Config("foo"))
         context.ch_config.load()
+    return context
+
+
+def _make_temporary_disks(
+    clickhouse_config_xml: str,
+    cloud_storage_disks: Optional[List[str]] = None,
+    data_copied: bool = False,
+    source_bucket: Optional[str] = "test-bucket",
+) -> ClickHouseTemporaryDisks:
+    """Helper: build ClickHouseTemporaryDisks with mocked dependencies."""
+    context = _make_context(_make_backup_storage_config(), clickhouse_config_xml)
+    context.backup_layout = _make_backup_layout(_make_backup_storage_config())
+    context.backup_meta.cloud_storage.disks = cloud_storage_disks or []
+    context.backup_meta.cloud_storage.enabled = bool(cloud_storage_disks)
+    context.backup_meta.cloud_storage.data_copied = data_copied
+    context.backup_meta.cloud_storage.requires_source_bucket = (
+        bool(cloud_storage_disks) and not data_copied
+    )
     return ClickHouseTemporaryDisks(
         context.ch_ctl,
         context.backup_layout,
@@ -350,24 +376,13 @@ def _make_backup_disks(
     """Helper: build ClickHouseBackupDisks with mocked dependencies."""
     config = _make_backup_storage_config()
     config["storage"].update(storage_config or {})
-    context = BackupContext(config)  # type: ignore[arg-type]
-    context.ch_ctl = unittest.mock.MagicMock()
+    context = _make_context(config, clickhouse_config_xml)
     context.ch_ctl.get_disk.return_value = Disk(
         "object_storage_backup", BACKUP_DISK_PATH, "s3"
     )
-    context.backup_meta = unittest.mock.MagicMock()
-    context.backup_meta.name = "20260101T000000"
-    context.backup_meta.get_sanitized_name.return_value = "20260101T000000"
-    with unittest.mock.patch(
-        "builtins.open",
-        new=unittest.mock.mock_open(read_data=clickhouse_config_xml),
-        create=True,
-    ):
-        with unittest.mock.patch("yaml.load", return_value=""):
-            context.ch_config = ClickhouseConfig(Config("foo"))
-        context.ch_config.load()
     disks = ClickHouseBackupDisks(
         context.ch_ctl,
+        _make_backup_layout(config),
         context.config_root,
         context.backup_meta,
         context.ch_config,

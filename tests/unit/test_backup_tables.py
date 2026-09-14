@@ -299,6 +299,7 @@ class TestCloudStorageCopyDataFlag:
         config["cloud_storage"] = cloud_conf
         context = BackupContext(config)  # type: ignore[arg-type]
         context.ch_ctl = MagicMock()
+        context.backup_layout = MagicMock()
         context.ch_config = MagicMock()
         context.ch_config.config = {}
         context.backup_meta = BackupMetadata(
@@ -377,7 +378,6 @@ class TestBackupCloudStorageMetadata:
         context.backup_layout.has_frozen_cloud_storage_data.return_value = (
             has_frozen_data
         )
-        context.backup_layout.upload_cloud_storage_metadata.return_value = True
         context.backup_meta = MagicMock()
         return context, context.backup_layout, context.backup_meta.cloud_storage
 
@@ -437,27 +437,20 @@ class TestBackupCloudStorageMetadata:
         that produced no metadata must fail the backup.
         """
         disk = Disk("s3", "/var/lib/clickhouse/disks/s3/", "s3")
+        backup_disk = Disk("s3_backup", "/var/lib/clickhouse/disks/s3_backup/", "s3")
         backup_disks = MagicMock()
+        backup_disks.copy_table_data.return_value = backup_disk
         context, layout, cloud_storage = self._make_context()
-        layout.upload_cloud_storage_metadata.return_value = False
+        layout.has_frozen_cloud_storage_data.side_effect = (
+            lambda _meta, checked_disk, _table: checked_disk is disk
+        )
 
         with pytest.raises(ClickhouseBackupError):
             TableBackup._backup_cloud_storage_metadata(
                 context, self._make_table([disk]), backup_disks
             )
 
-        cloud_storage.add_disk.assert_not_called()
-
-    def test_empty_upload_without_copying_is_not_an_error(self):
-        """
-        Without copying an empty result only means there is nothing to store.
-        """
-        disk = Disk("s3", "/var/lib/clickhouse/disks/s3/", "s3")
-        context, layout, cloud_storage = self._make_context()
-        layout.upload_cloud_storage_metadata.return_value = False
-
-        TableBackup._backup_cloud_storage_metadata(context, self._make_table([disk]))
-
+        layout.upload_cloud_storage_metadata.assert_not_called()
         cloud_storage.add_disk.assert_not_called()
 
     def test_local_disks_are_skipped(self):

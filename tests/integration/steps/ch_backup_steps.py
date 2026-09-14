@@ -125,11 +125,7 @@ def step_restore_backup(context, backup_id, node):
 def step_delete_backup(context, node, backup_id):
     options = get_step_data(context)
     ch_backup = BackupManager(context, node)
-    deleted_name = (
-        ch_backup.get_backup_ids()[backup_id]
-        if isinstance(backup_id, int)
-        else backup_id
-    )
+    deleted_name = ch_backup.normalize_id(backup_id)
     result = ch_backup.delete(backup_id, **options)
     assert_that(
         result,

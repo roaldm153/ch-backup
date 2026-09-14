@@ -19,6 +19,11 @@ TABLE_COUNT = 2
 ROWS_COUNT = 3
 PARTITIONS_COUNT = 1
 
+SYSTEM_DATABASES = (
+    "'system', '_temporary_and_external_tables', "
+    "'information_schema', 'INFORMATION_SCHEMA'"
+)
+
 ACCESS_TYPES = [
     ("users", "USER"),
     ("roles", "ROLE"),
@@ -177,9 +182,8 @@ class ClickhouseClient:
                    hash_of_uncompressed_files,
                    uncompressed_hash_of_compressed_files
             FROM system.parts
-            WHERE active AND database NOT IN ('system', '_temporary_and_external_tables',
-                                              'information_schema', 'INFORMATION_SCHEMA',
-                                              '{self._system_database}')
+            WHERE active
+              AND database NOT IN ({SYSTEM_DATABASES}, '{self._system_database}')
             ORDER BY database, table, name
             FORMAT JSONCompact
             """
@@ -195,8 +199,7 @@ class ClickhouseClient:
                 name,
                 create_table_query
             FROM system.tables
-            WHERE database NOT IN ('system', '_temporary_and_external_tables',
-                                   'information_schema', 'INFORMATION_SCHEMA', '{self._system_database}')
+            WHERE database NOT IN ({SYSTEM_DATABASES}, '{self._system_database}')
             FORMAT JSON
             """
         tables = self._query("GET", query)["data"]
@@ -214,8 +217,7 @@ class ClickhouseClient:
         query = f"""
             SELECT name
             FROM system.databases
-            WHERE name NOT IN ('system', '_temporary_and_external_tables',
-                               'information_schema', 'INFORMATION_SCHEMA', '{self._system_database}')
+            WHERE name NOT IN ({SYSTEM_DATABASES}, '{self._system_database}')
             FORMAT JSONCompact
             """
 
@@ -307,8 +309,7 @@ class ClickhouseClient:
                 groupArray(c.name) "columns"
             FROM system.tables t
             JOIN system.columns c ON (t.database = c.database AND t.name = c.table)
-            WHERE database NOT IN ('system', '_temporary_and_external_tables',
-                                   'information_schema', 'INFORMATION_SCHEMA', '{self._system_database}')
+            WHERE database NOT IN ({SYSTEM_DATABASES}, '{self._system_database}')
               AND t.engine NOT IN ('View', 'MaterializedView', 'Distributed')
             GROUP BY database, table
             ORDER BY database, table

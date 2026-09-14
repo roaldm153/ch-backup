@@ -103,6 +103,7 @@ class TableBackup(BackupManager):
                 backup_disks = stack.enter_context(
                     ClickHouseBackupDisks(
                         context.ch_ctl,
+                        context.backup_layout,
                         context.config_root,
                         context.backup_meta,
                         context.ch_config,
@@ -328,6 +329,8 @@ class TableBackup(BackupManager):
 
         When backup_disks is set, disk data is also copied into the backup and
         metadata referring to the copies is uploaded instead of the frozen one.
+        Such a copy is verified explicitly, since clickhouse-disks reports its
+        errors with a zero exit code.
         """
         logging.debug(
             'Backing up Cloud Storage disks "shadow" directory of "{}"."{}"',
@@ -347,17 +350,18 @@ class TableBackup(BackupManager):
             source_disk = (
                 backup_disks.copy_table_data(disk.name, table) if backup_disks else None
             )
-            if context.backup_layout.upload_cloud_storage_metadata(
-                context.backup_meta, disk, table, source_disk=source_disk
+            if source_disk and not context.backup_layout.has_frozen_cloud_storage_data(
+                context.backup_meta, source_disk, table
             ):
-                context.backup_meta.cloud_storage.add_disk(disk.name)
-            elif source_disk:
-                # clickhouse-disks reports copy errors with a zero exit code,
-                # so an empty result is the only sign that the copy has failed
                 raise ClickhouseBackupError(
                     f'Copying data of disk "{disk.name}" of table '
                     f"`{table.database}`.`{table.name}` produced no metadata"
                 )
+
+            context.backup_layout.upload_cloud_storage_metadata(
+                context.backup_meta, disk, table, source_disk=source_disk
+            )
+            context.backup_meta.cloud_storage.add_disk(disk.name)
 
     # pylint: disable=too-many-arguments,too-many-locals,too-many-positional-arguments
     def restore(

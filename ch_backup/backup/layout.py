@@ -269,23 +269,19 @@ class BackupLayout:
         )
         return not dir_is_empty(shadow_path, CLOUD_STORAGE_EXCLUDE_FILE_NAMES)
 
-    # pylint: disable=too-many-positional-arguments
     def upload_cloud_storage_metadata(
         self,
         backup_meta: BackupMetadata,
         disk: Disk,
         table: Table,
-        delete_after_upload: bool = False,
         source_disk: Optional[Disk] = None,
-    ) -> bool:
+    ) -> None:
         """
         Upload specified disk metadata files from given directory path as a tarball.
 
         Metadata files are read from source_disk when it is set. That is the case
         when cloud storage data is copied into the backup: metadata referring to
         the copies is written by ClickHouse to a temporary disk.
-
-        Returns: whether backed up disk had data.
         """
         assert table.path_on_disk, f"Table {table} doesn't store data on disk"
 
@@ -301,8 +297,6 @@ class BackupLayout:
         shadow_path = _table_shadow_path(
             (source_disk or disk).path, backup_name, table.path_on_disk
         )
-        if dir_is_empty(shadow_path, CLOUD_STORAGE_EXCLUDE_FILE_NAMES):
-            return False
 
         logging.debug(f'Uploading "{shadow_path}" content to "{remote_path}"')
 
@@ -314,13 +308,12 @@ class BackupLayout:
                 exclude_file_names=CLOUD_STORAGE_EXCLUDE_FILE_NAMES,
                 is_async=True,
                 encryption=backup_meta.cloud_storage.encrypted,
-                delete=delete_after_upload,
+                delete=False,
                 compression=compression,
             )
         except Exception as e:
             msg = f'Failed to upload "{shadow_path}" content to "{remote_path}"'
             raise StorageError(msg) from e
-        return True
 
     def upload_named_collections_ddl_from_file(
         self, local_path: str, backup_name: str, nc_name: str
@@ -902,11 +895,12 @@ class BackupLayout:
         logging.debug("Deleting cloud storage data of backup {}", backup_name)
 
         deleting_files: List[str] = []
-        for directory in (CLOUD_STORAGE_METADATA_DIR, CLOUD_STORAGE_DATA_DIR):
+        for directory in (
+            os.path.join(cloud_storage_path, CLOUD_STORAGE_METADATA_DIR),
+            self.get_cloud_storage_data_path(backup_name),
+        ):
             deleting_files += self._storage_loader.list_dir(
-                os.path.join(cloud_storage_path, directory),
-                recursive=True,
-                absolute=True,
+                directory, recursive=True, absolute=True
             )
         self._delete_files(deleting_files)
 
@@ -968,6 +962,17 @@ class BackupLayout:
         written by ClickHouse itself.
         """
         return self.get_backup_path(sanitize_backup_name(backup_name))
+
+    def get_cloud_storage_data_path(
+        self, backup_name: str, disk_name: Optional[str] = None
+    ) -> str:
+        """
+        Get path of cloud storage data copied into a backup.
+        """
+        path = os.path.join(
+            self.get_cloud_storage_path(backup_name), CLOUD_STORAGE_DATA_DIR
+        )
+        return os.path.join(path, disk_name) if disk_name else path
 
     def _delete_files(self, remote_paths: Sequence[str]) -> None:
         """
@@ -1114,13 +1119,22 @@ def _disk_metadata_path(
     )
 
 
+def table_shadow_relpath(backup_name: str, table_path_on_disk: str) -> str:
+    """
+    Returns path to frozen table data relative to the root of a disk.
+    """
+    return os.path.join("shadow", backup_name, table_path_on_disk)
+
+
 def _table_shadow_path(
     disk_path: str, backup_name: str, table_path_on_disk: str
 ) -> str:
     """
     Returns path to frozen table data on given disk.
     """
-    return os.path.join(disk_path, "shadow", backup_name, table_path_on_disk)
+    return os.path.join(
+        disk_path, table_shadow_relpath(backup_name, table_path_on_disk)
+    )
 
 
 def _quote(value: str) -> str:

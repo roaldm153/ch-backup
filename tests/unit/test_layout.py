@@ -1,5 +1,6 @@
 """Unit tests for backup layout cloud metadata path selection."""
 
+import copy
 import os
 from collections import Counter
 from unittest.mock import MagicMock, patch
@@ -10,20 +11,27 @@ from ch_backup.clickhouse.models import Disk, Table
 from ch_backup.config import DEFAULT_CONFIG
 
 
+def make_layout() -> BackupLayout:
+    """Helper: build a BackupLayout with a mocked storage loader."""
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config["backup"]["path_root"] = "ch_backup"
+    with (
+        patch("ch_backup.backup.layout.StorageLoader"),
+        patch("ch_backup.backup.layout.get_encryption") as get_encryption,
+    ):
+        get_encryption.return_value.metadata_size.return_value = 0
+        layout = BackupLayout(config)  # type: ignore[arg-type]
+    setattr(layout, "_storage_loader", MagicMock())
+    return layout
+
+
 class TestCloudStorageMetadataRemotePaths:
     """Tests for filtered cloud metadata remote path selection."""
 
     # pylint: disable=protected-access
 
     def test_prefers_old_style_and_filters_exact_per_table_paths(self):
-        with (
-            patch("ch_backup.backup.layout.StorageLoader"),
-            patch("ch_backup.backup.layout.get_encryption") as get_encryption,
-        ):
-            get_encryption.return_value.metadata_size.return_value = 0
-            layout = BackupLayout(DEFAULT_CONFIG)  # type: ignore[arg-type]
-        layout._storage_loader = MagicMock()
-        layout._config["path_root"] = "ch_backup"
+        layout = make_layout()
 
         backup_name = "backup"
         source_disk_name = "s3"
@@ -65,15 +73,8 @@ class TestCloudStorageMetadataUpload:
 
     @staticmethod
     def _make_layout() -> tuple[BackupLayout, MagicMock]:
-        """Helper: build a BackupLayout with a mocked storage loader."""
-        with (
-            patch("ch_backup.backup.layout.StorageLoader"),
-            patch("ch_backup.backup.layout.get_encryption") as get_encryption,
-        ):
-            get_encryption.return_value.metadata_size.return_value = 0
-            layout = BackupLayout(DEFAULT_CONFIG)  # type: ignore[arg-type]
-        layout._storage_loader = MagicMock()
-        layout._config["path_root"] = "ch_backup"
+        """Helper: build a BackupLayout and expose its storage loader."""
+        layout = make_layout()
         return layout, layout._storage_loader
 
     def _make_backup_meta(self) -> MagicMock:
@@ -165,17 +166,10 @@ class TestCloudStorageDataDeletion:
     @staticmethod
     def _make_layout() -> tuple[BackupLayout, MagicMock]:
         """Helper: build a BackupLayout that records paths passed for deletion."""
-        with (
-            patch("ch_backup.backup.layout.StorageLoader"),
-            patch("ch_backup.backup.layout.get_encryption") as get_encryption,
-        ):
-            get_encryption.return_value.metadata_size.return_value = 0
-            layout = BackupLayout(DEFAULT_CONFIG)  # type: ignore[arg-type]
-        layout._storage_loader = MagicMock()
+        layout = make_layout()
         layout._storage_loader.list_dir.side_effect = lambda path, **_kwargs: [
             f"{path}/object"
         ]
-        layout._config["path_root"] = "ch_backup"
         delete_files = MagicMock()
         setattr(layout, "_delete_files", delete_files)
         return layout, delete_files

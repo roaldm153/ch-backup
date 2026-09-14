@@ -5,6 +5,7 @@ ClickhouseBackup unit tests.
 from typing import Tuple
 from unittest.mock import MagicMock, patch
 
+from ch_backup.backup.metadata import CloudStorageMetadata
 from ch_backup.backup.sources import BackupSources
 from ch_backup.ch_backup import ClickhouseBackup, ClickhouseBackupError
 from ch_backup.config import DEFAULT_CONFIG
@@ -18,8 +19,9 @@ def _restore_backup_with_cloud_storage(
     backup.__dict__["_context"] = MagicMock()
 
     backup_meta = MagicMock()
-    backup_meta.cloud_storage.enabled = True
-    backup_meta.cloud_storage.data_copied = data_copied
+    backup_meta.cloud_storage = CloudStorageMetadata(
+        data_copied=data_copied, disks=["s3"]
+    )
     backup_meta.get_databases.return_value = []
 
     sources = BackupSources.for_restore(False, False, False, False, False, False, False)

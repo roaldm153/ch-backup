@@ -64,6 +64,13 @@ class CloudStorageMetadata:
         """
         return self._data_copied
 
+    @property
+    def requires_source_bucket(self) -> bool:
+        """
+        Return True if restore needs the bucket of the source installation.
+        """
+        return self.enabled and not self._data_copied
+
     def encrypt(self) -> None:
         """
         Encrypt Cloud Storage data within the backup.
