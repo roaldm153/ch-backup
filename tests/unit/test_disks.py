@@ -616,7 +616,7 @@ def test_backup_disk_is_cleaned_up_on_exit():
 
 def test_backup_disk_cleanup_is_omitted_on_error():
     """
-    Configuration of a failed backup must be left in place for investigation.
+    An error must not remove the disk configuration and its local data.
     """
     disk_manager, _ = _make_backup_disks(BACKUP_DISK_CLICKHOUSE_CONFIG)
 
@@ -665,8 +665,7 @@ def test_copy_table_data_copies_frozen_shadow_directory():
     assert (
         command_args.count("shadow/20260101T000000/store/abc/abcdef/") == 2
     ), command_args
-    # Only the parent is created: clickhouse-disks nests the copy one level
-    # deeper when the destination directory already exists
+    # The last directory is left to clickhouse-disks, see copy_table_data
     makedirs_mock.assert_called_once_with(
         os.path.join(BACKUP_DISK_PATH, "shadow/20260101T000000/store/abc"),
         exist_ok=True,

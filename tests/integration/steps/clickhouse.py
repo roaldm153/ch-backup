@@ -338,10 +338,6 @@ def step_save_part_checksums(context, node):
 
 @then("data part checksums equal to saved ones on {node:w}")
 def step_check_part_checksums(context, node):
-    """
-    Compare file checksums of data parts, which proves that restored data
-    is byte-identical to the original one.
-    """
     checksums = ClickhouseClient(context, node).get_all_part_checksums()
     assert_that(checksums, equal_to(context.part_checksums))
 

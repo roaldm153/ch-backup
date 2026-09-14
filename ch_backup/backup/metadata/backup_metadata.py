@@ -24,7 +24,7 @@ def sanitize_backup_name(name: str) -> str:
     """
     Return backup name usable as a directory name on ClickHouse side.
 
-    '-' character is replaced to '_' to avoid unnecessary escaping on CH side.
+    '-' character is replaced to '_' to avoid unnecessary escaping.
     """
     return name.replace("-", "_")
 

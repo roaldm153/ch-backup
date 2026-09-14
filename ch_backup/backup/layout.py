@@ -46,7 +46,6 @@ ACCESS_CONTROL_FNAME = "access_control.tar"
 DATABASES_FNAME = "databases.tar"
 COMPRESSED_EXTENSION = ".gz"
 CLOUD_STORAGE_EXCLUDE_FILE_NAMES = ["frozen_metadata.txt"]
-# Directories of a backup that are addressed by the sanitized backup name.
 CLOUD_STORAGE_METADATA_DIR = "disks"
 CLOUD_STORAGE_DATA_DIR = "cloud_storage"
 
@@ -260,7 +259,7 @@ class BackupLayout:
         self, backup_meta: BackupMetadata, disk: Disk, table: Table
     ) -> bool:
         """
-        Return True if table data is frozen on a given cloud storage disk.
+        Return True if a cloud storage disk holds shadow data of a table.
         """
         assert table.path_on_disk, f"Table {table} doesn't store data on disk"
 
@@ -277,11 +276,10 @@ class BackupLayout:
         source_disk: Optional[Disk] = None,
     ) -> None:
         """
-        Upload specified disk metadata files from given directory path as a tarball.
+        Upload disk metadata files of a table as a tarball.
 
-        Metadata files are read from source_disk when it is set. That is the case
-        when cloud storage data is copied into the backup: metadata referring to
-        the copies is written by ClickHouse to a temporary disk.
+        Metadata is read from source_disk when data is copied into the backup:
+        ClickHouse writes metadata of the copies to a temporary disk.
         """
         assert table.path_on_disk, f"Table {table} doesn't store data on disk"
 
@@ -956,10 +954,10 @@ class BackupLayout:
 
     def get_cloud_storage_path(self, backup_name: str) -> str:
         """
-        Get path of cloud storage data of a backup.
+        Get path of the backup directory with cloud storage metadata and data.
 
-        Cloud storage data is addressed by the sanitized backup name, since it is
-        written by ClickHouse itself.
+        ClickHouse writes cloud storage data under the sanitized backup name,
+        so the whole directory is addressed by it.
         """
         return self.get_backup_path(sanitize_backup_name(backup_name))
 

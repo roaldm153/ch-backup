@@ -470,8 +470,8 @@ def _backup_storage_endpoint(storage_config: Dict, key_prefix: str) -> str:
     """
     Build the backup storage URL of a given key prefix.
 
-    "auto" addressing style is treated as path-style: it is the only style
-    verified against the object storages ch-backup is used with.
+    "auto" addressing style is built as path-style, since it puts no
+    requirements on the bucket name.
     """
     credentials = storage_config["credentials"]
     endpoint_url = credentials["endpoint_url"].rstrip("/")

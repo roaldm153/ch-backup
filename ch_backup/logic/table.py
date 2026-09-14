@@ -327,10 +327,10 @@ class TableBackup(BackupManager):
         """
         Backup cloud storage metadata files.
 
-        When backup_disks is set, disk data is also copied into the backup and
-        metadata referring to the copies is uploaded instead of the frozen one.
-        Such a copy is verified explicitly, since clickhouse-disks reports its
-        errors with a zero exit code.
+        When backup_disks is set, disk data is copied into the backup and
+        metadata of the copies is uploaded instead of the frozen one. The copy
+        is checked explicitly, since clickhouse-disks reports its errors with
+        a zero exit code.
         """
         logging.debug(
             'Backing up Cloud Storage disks "shadow" directory of "{}"."{}"',
