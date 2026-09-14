@@ -480,18 +480,39 @@ def test_backup_disk_endpoint_follows_virtual_addressing_style():
     )
 
 
-def test_backup_disk_uses_the_proxy_of_the_backup_storage():
+def test_backup_disk_uses_the_proxy_resolver_of_the_backup_storage():
     """
     ClickHouse must reach the backup storage the same way ch-backup does.
-    """
-    with unittest.mock.patch(
-        "ch_backup.clickhouse.disks.resolve_proxy_host", return_value="proxy-host"
-    ):
-        disk_config = _created_disk_config(
-            {"proxy_resolver": {"uri": "http://resolver/", "proxy_port": 8080}}
-        )
 
-    assert_equal(disk_config["proxy"], {"uri": "http://proxy-host:8080"})
+    The resolver is passed on instead of a host resolved once, so that
+    ClickHouse picks a proxy per request and drops one that fails.
+    """
+    disk_config = _created_disk_config(
+        {"proxy_resolver": {"uri": "http://resolver/hostname", "proxy_port": 8080}}
+    )
+
+    assert_equal(
+        disk_config["proxy"],
+        {
+            "resolver": {
+                "endpoint": "http://resolver/hostname",
+                "proxy_scheme": "http",
+                "proxy_port": "8080",
+            }
+        },
+    )
+
+
+def test_backup_disk_proxy_resolver_endpoint_always_has_a_path():
+    """
+    ClickHouse builds the resolver request line out of the endpoint path
+    alone, so an empty path makes every resolve request malformed.
+    """
+    disk_config = _created_disk_config(
+        {"proxy_resolver": {"uri": "http://resolver:8080", "proxy_port": 4080}}
+    )
+
+    assert_equal(disk_config["proxy"]["resolver"]["endpoint"], "http://resolver:8080/")
 
 
 def test_backup_disk_has_no_proxy_without_a_resolver():
