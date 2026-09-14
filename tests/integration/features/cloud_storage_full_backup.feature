@@ -110,3 +110,164 @@ Feature: Full backup of cloud storage data
     """
     Cloud storage source bucket must be set
     """
+
+  @object_storage_copy
+  @require_version_24.1
+  Scenario Outline: Restore from a copy of cloud storage data of <part_format> parts
+    Given we have executed queries on clickhouse01
+    """
+    CREATE DATABASE IF NOT EXISTS test_db;
+    CREATE TABLE test_db.table_s3 (
+        CounterID UInt32,
+        UserID    UInt32,
+        Payload   String
+    )
+    ENGINE = MergeTree()
+    PARTITION BY CounterID % 8
+    ORDER BY UserID
+    SETTINGS storage_policy = 's3', min_bytes_for_wide_part = <min_bytes_for_wide_part>;
+
+    SYSTEM STOP MERGES test_db.table_s3;
+
+    INSERT INTO test_db.table_s3 SELECT number, number, repeat('a', 128) FROM system.numbers LIMIT 2000;
+    INSERT INTO test_db.table_s3 SELECT number, number, repeat('b', 128) FROM system.numbers LIMIT 2000;
+    INSERT INTO test_db.table_s3 SELECT number, number, repeat('c', 128) FROM system.numbers LIMIT 2000;
+    """
+    When we execute query on clickhouse01
+    """
+    SELECT count() FROM system.parts
+    WHERE database = 'test_db' AND table = 'table_s3' AND active AND part_type != '<part_format>'
+    """
+    Then we get response
+    """
+    0
+    """
+    When we save all user's data in context on clickhouse01
+    And we save data part checksums in context on clickhouse01
+    And we create clickhouse01 clickhouse backup
+    """
+    name: test_backup
+    copy_cloud_storage_data: true
+    """
+    Then s3 bucket ch-backup contains objects with prefix "ch_backup/test_backup/cloud_storage/s3/"
+    When we delete all objects in s3 bucket cloud-storage-01
+    And we restore clickhouse backup #0 to clickhouse02
+    Then the user's data equal to saved one on clickhouse02
+    And data part checksums equal to saved ones on clickhouse02
+
+    Examples:
+      | part_format | min_bytes_for_wide_part |
+      | Compact     | 10000000                |
+      | Wide        | 0                       |
+
+  @object_storage_copy
+  @require_version_24.1
+  Scenario: Restore from a copy of cloud storage data spread over two disks
+    Given we have executed queries on clickhouse01
+    """
+    CREATE DATABASE IF NOT EXISTS test_db;
+    CREATE TABLE test_db.table_s3 (
+        CounterID UInt32,
+        UserID    UInt32,
+        Payload   String
+    )
+    ENGINE = MergeTree()
+    PARTITION BY CounterID
+    ORDER BY UserID
+    SETTINGS storage_policy = 'multiple_s3';
+
+    INSERT INTO test_db.table_s3 SELECT 0, number, repeat('a', 256) FROM system.numbers LIMIT 1000;
+    INSERT INTO test_db.table_s3 SELECT 1, number, repeat('b', 256) FROM system.numbers LIMIT 1000;
+
+    ALTER TABLE test_db.table_s3 MOVE PARTITION 1 TO DISK 's3_second';
+    """
+    # Without this check the scenario silently degrades to the single disk case.
+    When we execute query on clickhouse01
+    """
+    SELECT countDistinct(disk_name) FROM system.parts
+    WHERE database = 'test_db' AND table = 'table_s3' AND active
+    """
+    Then we get response
+    """
+    2
+    """
+    When we save all user's data in context on clickhouse01
+    And we save data part checksums in context on clickhouse01
+    And we create clickhouse01 clickhouse backup
+    """
+    name: test_backup
+    copy_cloud_storage_data: true
+    """
+    Then s3 bucket ch-backup contains objects with prefix "ch_backup/test_backup/cloud_storage/s3/"
+    And s3 bucket ch-backup contains objects with prefix "ch_backup/test_backup/cloud_storage/s3_second/"
+    When we delete all objects in s3 bucket cloud-storage-01
+    And we restore clickhouse backup #0 to clickhouse02
+    Then the user's data equal to saved one on clickhouse02
+    And data part checksums equal to saved ones on clickhouse02
+
+  @object_storage_copy
+  @require_version_24.1
+  Scenario: Restore a table stored on both a local and a cloud storage disk
+    Given we have executed queries on clickhouse01
+    """
+    CREATE DATABASE IF NOT EXISTS test_db;
+    CREATE TABLE test_db.table_s3 (
+        CounterID UInt32,
+        UserID    UInt32,
+        Payload   String
+    )
+    ENGINE = MergeTree()
+    PARTITION BY CounterID
+    ORDER BY UserID
+    SETTINGS storage_policy = 's3_cold';
+
+    INSERT INTO test_db.table_s3 SELECT 0, number, repeat('a', 256) FROM system.numbers LIMIT 1000;
+    INSERT INTO test_db.table_s3 SELECT 1, number, repeat('b', 256) FROM system.numbers LIMIT 1000;
+
+    ALTER TABLE test_db.table_s3 MOVE PARTITION 1 TO VOLUME 'external';
+    """
+    When we execute query on clickhouse01
+    """
+    SELECT count() FROM system.parts
+    WHERE database = 'test_db' AND table = 'table_s3' AND active AND disk_name = 'default'
+    """
+    Then we get response
+    """
+    1
+    """
+    When we save all user's data in context on clickhouse01
+    And we save data part checksums in context on clickhouse01
+    And we create clickhouse01 clickhouse backup
+    """
+    name: test_backup
+    copy_cloud_storage_data: true
+    """
+    Then s3 bucket ch-backup contains objects with prefix "ch_backup/test_backup/cloud_storage/s3/"
+    When we delete all objects in s3 bucket cloud-storage-01
+    And we restore clickhouse backup #0 to clickhouse02
+    Then the user's data equal to saved one on clickhouse02
+    And data part checksums equal to saved ones on clickhouse02
+
+  @object_storage_copy
+  @require_version_24.1
+  Scenario: Backup of a table without data on a cloud storage disk needs no source bucket
+    Given we have executed queries on clickhouse01
+    """
+    CREATE DATABASE IF NOT EXISTS test_db;
+    CREATE TABLE test_db.table_s3 (
+        CounterID UInt32,
+        UserID    UInt32
+    )
+    ENGINE = MergeTree()
+    ORDER BY UserID
+    SETTINGS storage_policy = 's3';
+    """
+    When we create clickhouse01 clickhouse backup
+    """
+    name: test_backup
+    copy_cloud_storage_data: true
+    """
+    Then s3 bucket ch-backup contains no objects with prefix "ch_backup/test_backup/cloud_storage/"
+    When we restore clickhouse backup #0 to clickhouse02
+    Then clickhouse02 has same schema as clickhouse01
+    And on clickhouse02 tables are empty
