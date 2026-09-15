@@ -12,11 +12,12 @@ import unittest
 import unittest.mock
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Dict, Iterator, List, Optional, Tuple
+from typing import IO, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import xmltodict
 
 from ch_backup.backup.layout import BackupLayout
+from ch_backup.backup.metadata import PartMetadata
 from ch_backup.backup_context import BackupContext
 from ch_backup.clickhouse.config import ClickhouseConfig
 from ch_backup.clickhouse.disks import (
@@ -259,21 +260,43 @@ def _make_context(config: dict, clickhouse_config_xml: str) -> BackupContext:
     return context
 
 
+def _make_linked_backup_meta(backup_name: str) -> unittest.mock.MagicMock:
+    """Helper: mock metadata of a backup holding data of deduplicated parts."""
+    backup_meta = unittest.mock.MagicMock()
+    backup_meta.name = backup_name
+    backup_meta.get_sanitized_name.return_value = backup_name
+    backup_meta.cloud_storage.data_copied = True
+    return backup_meta
+
+
+# pylint: disable=too-many-positional-arguments
 def _make_temporary_disks(
     clickhouse_config_xml: str,
     cloud_storage_disks: Optional[List[str]] = None,
     data_copied: bool = False,
     source_bucket: Optional[str] = "test-bucket",
+    parts: Sequence[PartMetadata] = (),
 ) -> ClickHouseTemporaryDisks:
     """Helper: build ClickHouseTemporaryDisks with mocked dependencies."""
     context = _make_context(_make_backup_storage_config(), clickhouse_config_xml)
     context.backup_layout = _make_backup_layout(_make_backup_storage_config())
+    context.backup_layout.get_backup.side_effect = lambda name, **_: (
+        _make_linked_backup_meta(name)
+    )
     context.backup_meta.cloud_storage.disks = cloud_storage_disks or []
     context.backup_meta.cloud_storage.enabled = bool(cloud_storage_disks)
     context.backup_meta.cloud_storage.data_copied = data_copied
     context.backup_meta.cloud_storage.requires_source_bucket = (
         bool(cloud_storage_disks) and not data_copied
     )
+
+    table = unittest.mock.MagicMock()
+    table.database = "db1"
+    table.name = "table1"
+    table.get_parts.return_value = list(parts)
+    context.backup_meta.get_databases.return_value = ["db1"]
+    context.backup_meta.get_tables.return_value = [table]
+
     return ClickHouseTemporaryDisks(
         context.ch_ctl,
         context.backup_layout,
@@ -825,3 +848,187 @@ def test_restore_and_backup_use_the_same_location():
             ]
 
     assert_equal(restore_endpoint, backup_endpoint)
+
+
+LINKED_BACKUP_NAME = "20251231T000000"
+
+
+def _make_linked_part(
+    name: str = "all_1_1_0", link_part_name: Optional[str] = None
+) -> PartMetadata:
+    """Helper: build metadata of a deduplicated part on a cloud storage disk."""
+    return PartMetadata(
+        database="db1",
+        table="table1",
+        name=name,
+        checksum="checksum",
+        size=1024,
+        files=["checksums.txt"],
+        tarball=True,
+        link=LINKED_BACKUP_NAME,
+        link_part_name=link_part_name,
+        disk_name="object_storage",
+    )
+
+
+def test_restore_creates_a_disk_per_backup_holding_data():
+    """
+    Data of a deduplicated part is left in the backup it was copied into, so
+    it is read through a temporary disk of that backup.
+    """
+    disk_manager = _make_temporary_disks(
+        BACKUP_DISK_CLICKHOUSE_CONFIG,
+        cloud_storage_disks=["object_storage"],
+        data_copied=True,
+        source_bucket=None,
+        parts=[_make_linked_part()],
+    )
+
+    with _capture_config_files() as (written, _):
+        with disk_manager:
+            pass
+
+    config_path = (
+        "/etc/clickhouse-server/config.d/"
+        f"cloud_storage_tmp_disk_object_storage_source_{LINKED_BACKUP_NAME}.xml"
+    )
+    disks = xmltodict.parse(written[config_path], disable_entities=False)["clickhouse"][
+        "storage_configuration"
+    ]["disks"]
+    assert_equal(
+        disks[f"object_storage_source_{LINKED_BACKUP_NAME}"]["endpoint"],
+        f"https://minio:9000/backup-bucket/ch_backup/{LINKED_BACKUP_NAME}"
+        "/cloud_storage/object_storage/",
+    )
+
+
+def test_restore_downloads_metadata_of_the_backup_holding_data():
+    """
+    Metadata of a deduplicated part is stored in the backup its data was
+    copied into, together with the keys of the objects.
+    """
+    disk_manager = _make_temporary_disks(
+        BACKUP_DISK_CLICKHOUSE_CONFIG,
+        cloud_storage_disks=["object_storage"],
+        data_copied=True,
+        source_bucket=None,
+        parts=[_make_linked_part()],
+    )
+
+    with _capture_config_files():
+        with disk_manager:
+            pass
+
+    # pylint: disable=protected-access
+    download = disk_manager._backup_layout.download_cloud_storage_metadata
+    downloaded_backups = [call.args[0].name for call in download.call_args_list]
+    assert LINKED_BACKUP_NAME in downloaded_backups
+
+
+def test_restore_copies_a_deduplicated_part_from_its_own_backup():
+    """
+    A part is copied from the temporary disk of the backup holding its data.
+    """
+    part = _make_linked_part()
+    disk_manager = _make_temporary_disks(
+        BACKUP_DISK_CLICKHOUSE_CONFIG,
+        cloud_storage_disks=["object_storage"],
+        data_copied=True,
+        source_bucket=None,
+        parts=[part],
+    )
+    target_disk = Disk(
+        "object_storage", "/var/lib/clickhouse/disks/object_storage/", "s3"
+    )
+    source_disk_name = f"object_storage_source_{LINKED_BACKUP_NAME}"
+    # pylint: disable=protected-access
+    disk_manager._ch_availible_disks = {
+        "object_storage": target_disk,
+        source_disk_name: Disk(source_disk_name, BACKUP_DISK_PATH, "s3"),
+    }
+    table = Table(
+        "db1",
+        "table1",
+        "MergeTree",
+        [target_disk],
+        [os.path.join(target_disk.path, "store/abc/abcdef")],
+        "",
+        "",
+        None,
+    )
+
+    with unittest.mock.patch(
+        "ch_backup.clickhouse.disks._ch_disks_copy"
+    ) as copy_command:
+        disk_manager._run_copy_command(disk_manager._backup_meta, table, part)
+
+    _, from_disk, from_path, _, _, _ = copy_command.call_args.args
+    assert_equal(from_disk, source_disk_name)
+    assert_equal(from_path, f"shadow/{LINKED_BACKUP_NAME}/store/abc/abcdef/all_1_1_0/")
+
+
+def test_restore_copies_a_renamed_part_under_its_stored_name():
+    """
+    A mutation renames a part, and its data is stored under the name it had in
+    the backup it was copied into.
+    """
+    part = _make_linked_part(name="all_1_1_0_2", link_part_name="all_1_1_0")
+    disk_manager = _make_temporary_disks(
+        BACKUP_DISK_CLICKHOUSE_CONFIG,
+        cloud_storage_disks=["object_storage"],
+        data_copied=True,
+        source_bucket=None,
+        parts=[part],
+    )
+    target_disk = Disk(
+        "object_storage", "/var/lib/clickhouse/disks/object_storage/", "s3"
+    )
+    source_disk_name = f"object_storage_source_{LINKED_BACKUP_NAME}"
+    # pylint: disable=protected-access
+    disk_manager._ch_availible_disks = {
+        "object_storage": target_disk,
+        source_disk_name: Disk(source_disk_name, BACKUP_DISK_PATH, "s3"),
+    }
+    table = Table(
+        "db1",
+        "table1",
+        "MergeTree",
+        [target_disk],
+        [os.path.join(target_disk.path, "store/abc/abcdef")],
+        "",
+        "",
+        None,
+    )
+
+    with unittest.mock.patch(
+        "ch_backup.clickhouse.disks._ch_disks_copy"
+    ) as copy_command:
+        disk_manager._run_copy_command(disk_manager._backup_meta, table, part)
+
+    _, _, from_path, _, _, _ = copy_command.call_args.args
+    assert_equal(from_path, f"shadow/{LINKED_BACKUP_NAME}/store/abc/abcdef/all_1_1_0/")
+
+
+def test_restore_fails_when_the_backup_holding_data_is_gone():
+    """
+    A missing backup must be reported instead of silently restoring a table
+    without parts of it.
+    """
+    disk_manager = _make_temporary_disks(
+        BACKUP_DISK_CLICKHOUSE_CONFIG,
+        cloud_storage_disks=["object_storage"],
+        data_copied=True,
+        source_bucket=None,
+        parts=[_make_linked_part()],
+    )
+    # pylint: disable=protected-access
+    disk_manager._backup_layout.get_backup.side_effect = None
+    disk_manager._backup_layout.get_backup.return_value = None
+
+    with _capture_config_files():
+        try:
+            with disk_manager:
+                pass
+            assert False, "Expected ClickHouseDisksException was not raised"
+        except ClickHouseDisksException as exc:
+            assert LINKED_BACKUP_NAME in str(exc)

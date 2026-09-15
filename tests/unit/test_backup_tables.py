@@ -7,10 +7,10 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
-from ch_backup.backup.metadata import BackupMetadata, PartMetadata
+from ch_backup.backup.metadata import BackupMetadata, PartMetadata, TableMetadata
 from ch_backup.backup_context import BackupContext
 from ch_backup.clickhouse.disks import ClickHouseDisksException
-from ch_backup.clickhouse.models import Database, Disk, Table
+from ch_backup.clickhouse.models import Database, Disk, FrozenPart, Table
 from ch_backup.config import DEFAULT_CONFIG
 from ch_backup.exceptions import ClickhouseBackupError
 from ch_backup.logic.table import TableBackup, TableMetadataChangeTime
@@ -633,3 +633,180 @@ class TestCloudStorageCopyPool:
 
         with pytest.raises(ClickHouseDisksException):
             self._run_backup(backup_disks, table_count=2)
+
+
+class TestCloudStorageDeduplication:
+    """
+    Tests for deduplication of parts stored on cloud storage disks.
+    """
+
+    # pylint: disable=protected-access
+
+    _BACKUP_NAME = "20181017T210300"
+    _DISK = Disk("s3", "/var/lib/clickhouse/disks/s3/", "s3")
+    _OTHER_DISK = Disk("s3_second", "/var/lib/clickhouse/disks/s3_second/", "s3")
+
+    @classmethod
+    def _make_table(cls) -> Table:
+        disks = [cls._DISK, cls._OTHER_DISK]
+        return Table(
+            "db1",
+            "table1",
+            "MergeTree",
+            disks,
+            [os.path.join(disk.path, "store/abc/abcdef") for disk in disks],
+            "/var/lib/clickhouse/metadata/db1/table1.sql",
+            "",
+            UUID,
+        )
+
+    @classmethod
+    def _make_frozen_part(cls, name: str, disk: Disk) -> FrozenPart:
+        return FrozenPart(
+            "db1",
+            "table1",
+            name,
+            disk.name,
+            os.path.join(
+                disk.path, "shadow", cls._BACKUP_NAME, "store/abc/abcdef", name
+            ),
+            "checksum",
+            1024,
+            ["checksums.txt"],
+        )
+
+    @classmethod
+    def _make_context(cls, copy_data: bool = True) -> BackupContext:
+        """Helper: build a context backing up a table stored on cloud storage."""
+        config: dict = copy.deepcopy(DEFAULT_CONFIG)
+        context = BackupContext(config)  # type: ignore[arg-type]
+        context.ch_ctl = Mock()
+        context.backup_layout = MagicMock()
+        context.backup_meta = BackupMetadata(
+            name=cls._BACKUP_NAME,
+            path=f"ch_backup/{cls._BACKUP_NAME}",
+            version="1.0.100",
+            ch_version="19.1.16",
+            time_format="%Y-%m-%dT%H:%M:%S%Z",
+            hostname="clickhouse01.test_net_711",
+        )
+        context.backup_meta.add_database(
+            Database(
+                "db1", "Atomic", "/var/lib/clickhouse/metadata/db1.sql", None, None
+            )
+        )
+        context.backup_meta.add_table(TableMetadata("db1", "table1", "MergeTree", UUID))
+        if copy_data:
+            context.backup_meta.cloud_storage.copy_data()
+        return context
+
+    @staticmethod
+    def _make_deduplicated_part(name: str, disk_name: str) -> PartMetadata:
+        return PartMetadata(
+            database="db1",
+            table="table1",
+            name=name,
+            checksum="checksum",
+            size=1024,
+            files=["checksums.txt"],
+            tarball=True,
+            link="20181016T210300",
+            disk_name=disk_name,
+        )
+
+    @classmethod
+    def _backup_frozen_parts(
+        cls, context: BackupContext, frozen_parts: List[FrozenPart], deduplicated: dict
+    ) -> None:
+        """Helper: back up given frozen parts with a fixed deduplication result."""
+        context.ch_ctl.scan_frozen_parts.side_effect = lambda _table, disk, *_: [
+            part for part in frozen_parts if part.disk_name == disk.name
+        ]
+        with patch(
+            "ch_backup.logic.table.deduplicate_parts", return_value=deduplicated
+        ) as deduplicate:
+            TableBackup()._backup_frozen_table_data(
+                context, cls._make_table(), cls._BACKUP_NAME
+            )
+        context.deduplicate_mock = deduplicate  # type: ignore[attr-defined]
+
+    def test_deduplicated_part_is_linked_and_dropped_from_shadow(self):
+        """
+        A deduplicated part must be left out of the copy of the table data.
+        """
+        context = self._make_context()
+        frozen_part = self._make_frozen_part("all_1_1_0", self._DISK)
+
+        self._backup_frozen_parts(
+            context,
+            [frozen_part],
+            {"all_1_1_0": self._make_deduplicated_part("all_1_1_0", "s3")},
+        )
+
+        context.ch_ctl.remove_freezed_part.assert_called_once_with(frozen_part)
+        part = next(iter(context.backup_meta.get_tables("db1")[0].get_parts()))
+        assert part.link == "20181016T210300"
+        assert context.backup_meta.cloud_storage.disks == ["s3"]
+
+    def test_part_that_is_not_deduplicated_stays_in_shadow(self):
+        """
+        A part that has to be copied must keep its frozen data.
+        """
+        context = self._make_context()
+
+        self._backup_frozen_parts(
+            context, [self._make_frozen_part("all_1_1_0", self._DISK)], {}
+        )
+
+        context.ch_ctl.remove_freezed_part.assert_not_called()
+        part = next(iter(context.backup_meta.get_tables("db1")[0].get_parts()))
+        assert part.link is None
+        assert context.backup_meta.cloud_storage.disks == ["s3"]
+
+    def test_disk_is_registered_even_when_nothing_is_copied(self):
+        """
+        Restore routes a part by its disk, so the disk of a fully deduplicated
+        table must still be listed in the backup.
+        """
+        context = self._make_context()
+
+        self._backup_frozen_parts(
+            context,
+            [self._make_frozen_part("all_1_1_0", self._DISK)],
+            {"all_1_1_0": self._make_deduplicated_part("all_1_1_0", "s3")},
+        )
+
+        assert context.backup_meta.cloud_storage.disks == ["s3"]
+
+    def test_match_on_another_disk_is_ignored(self):
+        """
+        Data of a part is bound to its disk, so a match on another disk is not
+        the same data.
+        """
+        context = self._make_context()
+        frozen_part = self._make_frozen_part("all_1_1_0", self._DISK)
+
+        self._backup_frozen_parts(
+            context,
+            [frozen_part],
+            {"all_1_1_0": self._make_deduplicated_part("all_1_1_0", "s3_second")},
+        )
+
+        context.ch_ctl.remove_freezed_part.assert_not_called()
+        part = next(iter(context.backup_meta.get_tables("db1")[0].get_parts()))
+        assert part.link is None
+
+    def test_parts_are_not_deduplicated_without_copying(self):
+        """
+        Without copying, a part on a cloud storage disk is a reference to the
+        source bucket and has nothing to be deduplicated against.
+        """
+        context = self._make_context(copy_data=False)
+
+        self._backup_frozen_parts(
+            context, [self._make_frozen_part("all_1_1_0", self._DISK)], {}
+        )
+
+        context.deduplicate_mock.assert_not_called()  # type: ignore[attr-defined]
+        part = next(iter(context.backup_meta.get_tables("db1")[0].get_parts()))
+        assert part.link is None

@@ -617,6 +617,40 @@ class TableBackup(BackupManager):
                     )
             frozen_parts.clear()
 
+        def deduplicate_cloud_parts_in_batch(
+            context: BackupContext,
+            frozen_parts: Dict[str, FrozenPart],
+        ) -> None:
+            """
+            Deduplicate parts stored on cloud storage disks.
+
+            Frozen data of a deduplicated part is removed, so that the part is
+            left out of the copy of the table data.
+            """
+            deduplicated_parts = deduplicate_parts(
+                context,
+                table.database,
+                table.name,
+                frozen_parts,
+                cloud_storage=True,
+            )
+            logging.debug(
+                "{} out of {} cloud storage parts are deduplicated",
+                len(deduplicated_parts),
+                len(frozen_parts),
+            )
+
+            for part_name, frozen_part in frozen_parts.items():
+                part = deduplicated_parts.get(part_name)
+                if part and part.disk_name == frozen_part.disk_name:
+                    context.ch_ctl.remove_freezed_part(frozen_part)
+                else:
+                    part = PartMetadata.from_frozen_part(
+                        frozen_part, context.backup_meta.encrypted
+                    )
+                context.backup_meta.add_part(part)
+            frozen_parts.clear()
+
         logging.debug(
             'Performing table backup for "{}"."{}"', table.database, table.name
         )
@@ -634,6 +668,8 @@ class TableBackup(BackupManager):
         upload_observer = UploadPartObserver(context)
 
         frozen_parts_batch: Dict[str, FrozenPart] = {}
+        cloud_parts_batch: Dict[str, FrozenPart] = {}
+        deduplicate_cloud_parts = context.backup_meta.cloud_storage.data_copied
         dedup_batch_size = context.config["deduplication_batch_size"]
         for data_path, disk in table.paths_with_disks:
             for fpart in context.ch_ctl.scan_frozen_parts(
@@ -644,11 +680,18 @@ class TableBackup(BackupManager):
             ):
                 logging.debug("Working on {}", fpart)
                 if disk.type == "s3":
-                    context.backup_meta.add_part(
-                        PartMetadata.from_frozen_part(
-                            fpart, context.backup_meta.encrypted
+                    if disk.cache_path or not deduplicate_cloud_parts:
+                        context.backup_meta.add_part(
+                            PartMetadata.from_frozen_part(
+                                fpart, context.backup_meta.encrypted
+                            )
                         )
-                    )
+                        continue
+
+                    context.backup_meta.cloud_storage.add_disk(disk.name)
+                    cloud_parts_batch[fpart.name] = fpart
+                    if len(cloud_parts_batch) >= dedup_batch_size:
+                        deduplicate_cloud_parts_in_batch(context, cloud_parts_batch)
                     continue
 
                 frozen_parts_batch[fpart.name] = fpart
@@ -664,6 +707,8 @@ class TableBackup(BackupManager):
                 upload_observer,
                 frozen_parts_batch,
             )
+        if cloud_parts_batch:
+            deduplicate_cloud_parts_in_batch(context, cloud_parts_batch)
 
         context.backup_layout.wait()
 

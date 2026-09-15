@@ -505,6 +505,9 @@ class ClickhouseBackup:
                 return backup.name, None
 
             logging.info("Removing non-shared backup data parts")
+            cloud_data_shared = self._cloud_storage_data_is_shared(
+                backup, dedup_references
+            )
             for db_name in backup.get_databases():
                 db_dedup_references = dedup_references[db_name]
                 for table in backup.get_tables(db_name):
@@ -513,7 +516,12 @@ class ClickhouseBackup:
                     )
 
             if backup.cloud_storage.enabled:
-                self._context.backup_layout.delete_cloud_storage_data(backup.name)
+                if cloud_data_shared:
+                    logging.info(
+                        "Keeping cloud storage data of the backup, it is in use by subsequent backups"
+                    )
+                else:
+                    self._context.backup_layout.delete_cloud_storage_data(backup.name)
             self._context.ch_ctl.system_unfreeze(backup.name)
             return (
                 None,
@@ -532,6 +540,29 @@ class ClickhouseBackup:
             if dedup_references:
                 backup.state = BackupState.PARTIALLY_DELETED
                 self._context.backup_layout.upload_backup_metadata(backup)
+
+    @staticmethod
+    def _cloud_storage_data_is_shared(
+        backup: BackupMetadata, dedup_references: DedupReferences
+    ) -> bool:
+        """
+        Return True if parts of cloud storage disks of a backup are reused.
+
+        Keys of the objects are known only from the disk metadata inside the
+        backup, so its cloud storage data is kept whole until the last
+        reference to it is gone.
+        """
+        for db_name in backup.get_databases():
+            for table in backup.get_tables(db_name):
+                referenced_parts = dedup_references[db_name][table.name]
+                for part in table.get_parts():
+                    if (
+                        part.name in referenced_parts
+                        and part.disk_name in backup.cloud_storage.disks
+                    ):
+                        return True
+
+        return False
 
     def _delete_data_parts(
         self,

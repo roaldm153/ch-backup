@@ -5,7 +5,7 @@ Data part deduplication.
 from collections import defaultdict
 from copy import copy
 from datetime import timedelta
-from typing import Dict, List, Optional, Sequence, Set
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from ch_backup import logging
 from ch_backup.backup.layout import BackupLayout
@@ -197,6 +197,15 @@ def _populate_dedup_info(
                     if part.name in table_dedup_info:
                         continue
 
+                    # Data of a cloud storage part that is not copied into the
+                    # backup stays in the bucket of the source installation,
+                    # there is nothing in the backup to link to.
+                    if (
+                        part.disk_name in backup.cloud_storage.disks
+                        and not backup.cloud_storage.data_copied
+                    ):
+                        continue
+
                     if part.link:
                         verified = True
                         backup_name = part.link
@@ -265,11 +274,37 @@ def _is_mutation_renamed(current_name: str, dedup_part_name: str) -> bool:
     )
 
 
+def _part_data_exists(
+    layout: BackupLayout,
+    backup_name: str,
+    part: PartMetadata,
+    cloud_storage: bool,
+    checked_tables: Dict[Tuple[str, str], bool],
+) -> bool:
+    """
+    Check that data of a part is really present in the backup holding it.
+
+    Data of a cloud storage part is not stored as a part tarball, so what is
+    checked for it is the disk metadata of its table, which is the same for
+    every part of that table.
+    """
+    if not cloud_storage:
+        return layout.check_data_part(backup_name, part)
+
+    key = (backup_name, part.disk_name)
+    if key not in checked_tables:
+        checked_tables[key] = layout.has_cloud_storage_metadata(
+            backup_name, part.database, part.table, part.disk_name
+        )
+    return checked_tables[key]
+
+
 def deduplicate_parts(
     context: BackupContext,
     database: str,
     table: str,
     frozen_parts: Dict[str, FrozenPart],
+    cloud_storage: bool = False,
 ) -> Dict[str, PartMetadata]:
     """
     Deduplicate part if it's possible.
@@ -280,6 +315,7 @@ def deduplicate_parts(
         database, table, frozen_parts
     )
     deduplicated_parts: Dict[str, PartMetadata] = {}
+    checked_tables: Dict[Tuple[str, str], bool] = {}
 
     logging.debug(
         "Deduplication lookup for {}.{}: {} frozen parts, {} matches found. First match: {}",
@@ -331,7 +367,13 @@ def deduplicate_parts(
         )
 
         if not existing_part["verified"]:
-            if not layout.check_data_part(existing_part["backup_name"], part):
+            if not _part_data_exists(
+                layout,
+                existing_part["backup_name"],
+                part,
+                cloud_storage,
+                checked_tables,
+            ):
                 logging.debug(
                     'Part "{}" found in backup "{}", but it\'s invalid, skipping',
                     part.name,

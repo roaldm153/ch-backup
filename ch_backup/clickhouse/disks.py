@@ -6,6 +6,7 @@ import copy
 import os
 import shutil
 import threading
+from collections import defaultdict
 from contextlib import contextmanager
 from functools import partial
 from subprocess import PIPE, Popen
@@ -29,7 +30,11 @@ import xmltodict
 
 from ch_backup import logging
 from ch_backup.backup.layout import BackupLayout, table_shadow_relpath
-from ch_backup.backup.metadata import BackupMetadata, PartMetadata
+from ch_backup.backup.metadata import (
+    BackupMetadata,
+    PartMetadata,
+    sanitize_backup_name,
+)
 from ch_backup.backup.metadata.table_metadata import TableMetadata
 from ch_backup.clickhouse.config import ClickhouseConfig
 from ch_backup.clickhouse.control import ClickhouseCTL
@@ -88,7 +93,7 @@ class ClickHouseDiskManager:
             "disks", {}
         )
 
-    def _backup_disk_config(self, disk_name: str) -> Dict:
+    def _backup_disk_config(self, backup_name: str, disk_name: str) -> Dict:
         """
         Build a disk configuration pointing to data of a disk in the backup.
 
@@ -100,9 +105,7 @@ class ClickHouseDiskManager:
         _set_backup_storage(
             disk_config,
             self._storage_config,
-            self._backup_layout.get_cloud_storage_data_path(
-                self._backup_meta.name, disk_name
-            ),
+            self._backup_layout.get_cloud_storage_data_path(backup_name, disk_name),
         )
         disk_config["skip_access_check"] = str(True).lower()
         return disk_config
@@ -203,6 +206,10 @@ class ClickHouseTemporaryDisks(ClickHouseDiskManager):
                 disk_name,
                 self._desired_tables,
             )
+        for backup_meta, disk_name, tables in self._linked_backups_data():
+            self._create_temporary_disk(
+                backup_meta, disk_name, tables, link=backup_meta.name
+            )
         self._backup_layout.wait()
         self._ch_availible_disks = self._ch_ctl.get_disks()
         _render_ch_disks_config(self._disks)
@@ -216,13 +223,61 @@ class ClickHouseTemporaryDisks(ClickHouseDiskManager):
     ) -> bool:
         return self._cleanup(exc_type, value)
 
+    def _linked_backups_data(
+        self,
+    ) -> Iterator[Tuple[BackupMetadata, str, List[TableMetadata]]]:
+        """
+        Yield backups holding data of deduplicated parts on cloud storage disks.
+
+        Data of a deduplicated part is left in the backup it was copied into,
+        so it is read through a temporary disk of that backup.
+        """
+        links: Dict[str, Dict[str, Dict[Tuple[str, str], TableMetadata]]] = defaultdict(
+            lambda: defaultdict(dict)
+        )
+        for table in self._tables_to_restore():
+            for part in table.get_parts():
+                if not part.link:
+                    continue
+                if part.disk_name not in self._backup_meta.cloud_storage.disks:
+                    continue
+
+                links[part.link][part.disk_name][(table.database, table.name)] = table
+
+        for backup_name, disks in links.items():
+            backup_meta = self._backup_layout.get_backup(
+                backup_name, use_light_meta=True
+            )
+            if backup_meta is None or not backup_meta.cloud_storage.data_copied:
+                raise ClickHouseDisksException(
+                    f'Backup "{backup_name}" holding data of deduplicated parts'
+                    " is missing or holds no copied data"
+                )
+            for disk_name, tables in disks.items():
+                yield backup_meta, disk_name, list(tables.values())
+
+    def _tables_to_restore(self) -> Iterator[TableMetadata]:
+        """
+        Yield tables of the backup whose data is going to be restored.
+        """
+        desired = (
+            None
+            if self._desired_tables == "all"
+            else {(table.database, table.name) for table in self._desired_tables}
+        )
+        for db_name in self._backup_meta.get_databases():
+            for table in self._backup_meta.get_tables(db_name):
+                if desired is None or (table.database, table.name) in desired:
+                    yield table
+
     def _create_temporary_disk(
         self,
         backup_meta: BackupMetadata,
         disk_name: str,
         desired_tables: Sequence[TableMetadata] | Literal["all"] = "all",
+        link: Optional[str] = None,
     ) -> None:
-        tmp_disk_name = _get_tmp_disk_name(disk_name)
+        tmp_disk_name = _get_tmp_disk_name(disk_name, link)
         logging.debug(f"Creating tmp disk {tmp_disk_name}")
         if disk_name not in self._disks:
             raise ClickHouseDisksException(
@@ -232,7 +287,7 @@ class ClickHouseTemporaryDisks(ClickHouseDiskManager):
             )
 
         orig_disk_endpoint = self._disks[disk_name]["endpoint"]
-        disk_config = self._source_disk_config(disk_name)
+        disk_config = self._source_disk_config(backup_meta, disk_name)
         tmp_disk_endpoint = disk_config["endpoint"]
 
         if self._use_local_copy and not is_equal_s3_endpoints(
@@ -254,15 +309,15 @@ class ClickHouseTemporaryDisks(ClickHouseDiskManager):
             desired_tables,
         )
 
-    def _source_disk_config(self, disk_name: str) -> Dict:
+    def _source_disk_config(self, backup_meta: BackupMetadata, disk_name: str) -> Dict:
         """
         Build a disk configuration pointing to the location of the data.
 
         Data copied into the backup is read from the backup bucket, the rest
         from the bucket of the source ClickHouse installation.
         """
-        if self._backup_meta.cloud_storage.data_copied:
-            return self._backup_disk_config(disk_name)
+        if backup_meta.cloud_storage.data_copied:
+            return self._backup_disk_config(backup_meta.name, disk_name)
 
         disk_config = copy.copy(self._disks[disk_name])
         endpoint = urlparse(disk_config["endpoint"])
@@ -313,10 +368,13 @@ class ClickHouseTemporaryDisks(ClickHouseDiskManager):
         Copy data from temporary cloud storage disk to actual.
         """
         source_part_name = part.deduplicated_part_name
+        source_backup_name = part.link or backup_meta.name
 
         routine_tag = f"{table.database}.{table.name}::{source_part_name}"
         target_disk = self._ch_availible_disks[part.disk_name]
-        source_disk = self._ch_availible_disks[_get_tmp_disk_name(part.disk_name)]
+        source_disk = self._ch_availible_disks[
+            _get_tmp_disk_name(part.disk_name, part.link)
+        ]
         for path, disk in table.paths_with_disks:
             if disk.name == target_disk.name:
                 table_path = os.path.relpath(path, target_disk.path)
@@ -325,7 +383,7 @@ class ClickHouseTemporaryDisks(ClickHouseDiskManager):
                     target_path = os.path.join(target_path, part.name, "")
                 source_path = os.path.join(
                     "shadow",
-                    backup_meta.get_sanitized_name(),
+                    sanitize_backup_name(source_backup_name),
                     table_path,
                     source_part_name,
                     "",
@@ -422,7 +480,9 @@ class ClickHouseBackupDisks(ClickHouseDiskManager):
 
             logging.debug(f"Creating tmp disk {tmp_disk_name}")
             disk = self._register_disk(
-                disk_name, tmp_disk_name, self._backup_disk_config(disk_name)
+                disk_name,
+                tmp_disk_name,
+                self._backup_disk_config(self._backup_meta.name, disk_name),
             )
             _render_ch_disks_config(self._disks)
             return disk
@@ -677,10 +737,16 @@ def _get_config_path(config_dir: str, disk_name: str) -> str:
     return os.path.join(config_dir, f"cloud_storage_tmp_disk_{disk_name}.xml")
 
 
-def _get_tmp_disk_name(disk_name: str) -> str:
+def _get_tmp_disk_name(disk_name: str, backup_name: Optional[str] = None) -> str:
     """
     Return name of the temporary disk used to restore data of a given disk.
+
+    A backup name is set for a disk reading data of another backup, where data
+    of deduplicated parts is left.
     """
+    if backup_name:
+        return f"{disk_name}_source_{sanitize_backup_name(backup_name)}"
+
     return f"{disk_name}_source"
 
 

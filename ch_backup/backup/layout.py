@@ -806,6 +806,20 @@ class BackupLayout:
             os.makedirs(path, exist_ok=True)
             yield path
 
+    def has_cloud_storage_metadata(
+        self, backup_name: str, database: str, table: str, disk_name: str
+    ) -> bool:
+        """
+        Check that disk metadata of a table is stored in a backup.
+        """
+        backup_path = self.get_backup_path(backup_name)
+        return any(
+            self._storage_loader.path_exists(
+                _disk_metadata_path(backup_path, database, table, disk_name, compressed)
+            )
+            for compressed in (True, False)
+        )
+
     def cloud_storage_metadata_exists(
         self, backup_meta: BackupMetadata, disk: Disk
     ) -> bool:
@@ -885,8 +899,8 @@ class BackupLayout:
         """
         Delete cloud storage metadata and copied data of a backup.
 
-        Cloud storage data is never shared between backups, so it can be deleted
-        even when the rest of the backup is kept.
+        Data of a whole backup is deleted at once, so the caller must be sure
+        that no other backup reuses parts of it.
         """
         cloud_storage_path = self.get_cloud_storage_path(backup_name)
 
