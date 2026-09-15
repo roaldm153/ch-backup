@@ -5,6 +5,7 @@ Clickhouse-disks controls temporary cloud storage disks management.
 import copy
 import os
 import shutil
+import threading
 from contextlib import contextmanager
 from functools import partial
 from subprocess import PIPE, Popen
@@ -77,6 +78,7 @@ class ClickHouseDiskManager:
 
         self._disks: Dict[str, Dict] = {}
         self._created_disks: Dict[str, Disk] = {}
+        self._disks_lock = threading.Lock()
 
     def _read_configured_disks(self) -> None:
         """
@@ -380,6 +382,8 @@ class ClickHouseTemporaryDisks(ClickHouseDiskManager):
 class ClickHouseBackupDisks(ClickHouseDiskManager):
     """
     Manages temporary cloud storage disks pointing to the backup bucket.
+
+    Data is copied from several threads, so disks are created under a lock.
     """
 
     def __enter__(self) -> "ClickHouseBackupDisks":
@@ -407,20 +411,21 @@ class ClickHouseBackupDisks(ClickHouseDiskManager):
         Returns the already created disk if called for the same disk twice.
         """
         tmp_disk_name = _get_backup_disk_name(disk_name)
-        if tmp_disk_name in self._created_disks:
-            return self._created_disks[tmp_disk_name]
+        with self._disks_lock:
+            if tmp_disk_name in self._created_disks:
+                return self._created_disks[tmp_disk_name]
 
-        if disk_name not in self._disks:
-            raise ClickHouseDisksException(
-                f'Disk "{disk_name}" is missing from ClickHouse storage_configuration.'
+            if disk_name not in self._disks:
+                raise ClickHouseDisksException(
+                    f'Disk "{disk_name}" is missing from ClickHouse storage_configuration.'
+                )
+
+            logging.debug(f"Creating tmp disk {tmp_disk_name}")
+            disk = self._register_disk(
+                disk_name, tmp_disk_name, self._backup_disk_config(disk_name)
             )
-
-        logging.debug(f"Creating tmp disk {tmp_disk_name}")
-        disk = self._register_disk(
-            disk_name, tmp_disk_name, self._backup_disk_config(disk_name)
-        )
-        _render_ch_disks_config(self._disks)
-        return disk
+            _render_ch_disks_config(self._disks)
+            return disk
 
     def copy_table_data(self, disk_name: str, table: Table) -> Disk:
         """
@@ -558,12 +563,21 @@ def _open_config_file(path: str) -> Iterator[IO[str]]:
     """
     Open a config file for writing, readable by its owner only.
 
+    The file is replaced atomically: ClickHouse and already running
+    clickhouse-disks read these files while further disks are being added.
+
     Disk configurations contain object storage credentials.
     """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    tmp_path = f"{path}.tmp"
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        yield f
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yield f
+        os.replace(tmp_path, path)
+    except Exception:
+        _remove_file(tmp_path)
+        raise
 
 
 def _render_disks_config(

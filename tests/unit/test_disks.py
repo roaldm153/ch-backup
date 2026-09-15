@@ -5,9 +5,13 @@ Unit tests disks module.
 import copy
 import io
 import os
+import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
 from contextlib import contextmanager
+from pathlib import Path
 from typing import IO, Dict, Iterator, List, Optional, Tuple
 
 import xmltodict
@@ -20,6 +24,8 @@ from ch_backup.clickhouse.disks import (
     ClickHouseBackupDisks,
     ClickHouseDisksException,
     ClickHouseTemporaryDisks,
+    _open_config_file,
+    _render_disks_config,
 )
 from ch_backup.clickhouse.models import Disk, Table
 from ch_backup.config import DEFAULT_CONFIG, Config
@@ -593,6 +599,48 @@ def test_backup_disk_is_created_once():
             assert ch_ctl.reload_config.call_count == 1
 
     assert first is second
+
+
+def test_backup_disk_is_created_once_from_several_threads():
+    """
+    Tables are copied in parallel, so a disk shared by them must be registered
+    in ClickHouse once.
+    """
+    disk_manager, ch_ctl = _make_backup_disks(BACKUP_DISK_CLICKHOUSE_CONFIG)
+    ch_ctl.reload_config.side_effect = lambda: time.sleep(0.05)
+    created: List[Disk] = []
+
+    def create_disk() -> None:
+        created.append(disk_manager.create_disk("object_storage"))
+
+    with _capture_config_files():
+        with disk_manager:
+            threads = [threading.Thread(target=create_disk) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            assert ch_ctl.reload_config.call_count == 1
+
+    assert created[0] is created[1]
+
+
+def test_config_file_is_replaced_atomically():
+    """
+    Config files are read while further disks are being added, so a file must
+    never be seen half-written.
+    """
+    with tempfile.TemporaryDirectory() as config_dir:
+        path = os.path.join(config_dir, "disks.xml")
+        _render_disks_config(path, {"object_storage": {"type": "s3"}})
+
+        with _open_config_file(path) as f:
+            f.write("<clickhouse/>")
+            assert "object_storage" in Path(path).read_text(encoding="utf-8")
+
+        assert Path(path).read_text(encoding="utf-8") == "<clickhouse/>"
+        assert os.listdir(config_dir) == ["disks.xml"]
 
 
 def test_backup_disk_missing_disk_raises():
