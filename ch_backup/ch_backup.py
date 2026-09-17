@@ -628,6 +628,9 @@ class ClickhouseBackup:
         Keys of the objects are known only from the disk metadata inside the
         backup, so its cloud storage data is kept whole until the last
         reference to it is gone.
+
+        Parts of the backup are looked at, so it has to be called before
+        _delete_data_parts removes them from the metadata.
         """
         return any(
             part.name in dedup_references[table.database][table.name]

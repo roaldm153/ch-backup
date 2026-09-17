@@ -583,9 +583,14 @@ Feature: Full backup of cloud storage data
   @object_storage_copy
   @require_version_24.1
   Scenario: Purge keeps cloud storage data linked by a retained backup
+    # The time policy is checked after the count one and keeps every backup
+    # made today, so it has to be zeroed for the count to delete anything.
     Given ch-backup configuration on clickhouse01
     """
     backup:
+        retain_time:
+            weeks: 0
+            days: 0
         retain_count: 1
     """
     And we have executed queries on clickhouse01

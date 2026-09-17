@@ -655,18 +655,14 @@ def _remove_file(path: str) -> None:
 @contextmanager
 def _open_config_file(path: str) -> Iterator[IO[str]]:
     """
-    Open a config file for writing, readable by its owner only.
+    Open a config file for writing, replacing it atomically.
 
-    The file is replaced atomically: ClickHouse and already running
-    clickhouse-disks read these files while further disks are being added.
-
-    Disk configurations contain object storage credentials.
+    ClickHouse and already running clickhouse-disks read these files while
+    further disks are being added.
     """
     tmp_path = f"{path}.tmp"
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.fchmod(fd, 0o600)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             yield f
         os.replace(tmp_path, path)
     except Exception:

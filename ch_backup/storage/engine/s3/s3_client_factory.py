@@ -21,25 +21,6 @@ class S3BalancerUnknownHost(ValueError):
     """
 
 
-@retry((S3BalancerUnknownHost, requests.RequestException))
-def resolve_proxy_host(resolver_path: str) -> str:
-    """
-    Get proxy host name via a special handler.
-    """
-    # pylint: disable=missing-timeout
-    req = requests.get(resolver_path)
-    req.raise_for_status()
-    host = req.text
-    # Try to resolve hostname to check the output
-    try:
-        socket.getaddrinfo(host, 0)
-    except socket.gaierror:
-        raise S3BalancerUnknownHost(
-            f'{resolver_path} returned unknown hostname: "{host}"'
-        )
-    return host
-
-
 class S3ClientFactory:
     """
     Factory to create S3 client instances.
@@ -54,13 +35,25 @@ class S3ClientFactory:
             region_name=self._config["boto_config"]["region_name"],
         )
 
+    @retry((S3BalancerUnknownHost, requests.RequestException))
     def _resolve_proxies(self, resolver_path: str, proxy_port: int) -> dict | None:
         """
-        Get proxy connection settings via a special handler
+        Get proxy host name via a special handler
         """
+        # pylint: disable=missing-timeout
+
         if resolver_path is None:
             return None
-        host = resolve_proxy_host(resolver_path)
+        req = requests.get(resolver_path)
+        req.raise_for_status()
+        host = req.text
+        # Try to resolve hostname to check the output
+        try:
+            socket.getaddrinfo(host, 0)
+        except socket.gaierror:
+            raise S3BalancerUnknownHost(
+                f'{resolver_path} returned unknown hostname: "{host}"'
+            )
         return {
             "http": f"{host}:{proxy_port}",
             "https": f"{host}:{proxy_port}",
