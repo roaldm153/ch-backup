@@ -1,5 +1,6 @@
 import copy
 import os
+import threading
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 from unittest.mock import MagicMock, Mock, call, patch
@@ -9,10 +10,12 @@ import pytest
 from ch_backup.backup.metadata import BackupMetadata, PartMetadata
 from ch_backup.backup_context import BackupContext
 from ch_backup.clickhouse.client import ClickhouseError
+from ch_backup.clickhouse.disks import ClickHouseDisksException
 from ch_backup.clickhouse.models import Database, Disk, Table
 from ch_backup.config import DEFAULT_CONFIG
 from ch_backup.exceptions import ClickhouseBackupError
 from ch_backup.logic.table import TableBackup, TableMetadataChangeTime
+from ch_backup.storage.async_pipeline.base_pipeline.exec_pool import ThreadExecPool
 
 UUID = "fa8ff291-1922-4b7f-afa7-06633d5e16ae"
 
@@ -499,6 +502,17 @@ class TestBackupCloudStorageMetadata:
         context.backup_meta = MagicMock()
         return context, context.backup_layout, context.backup_meta.cloud_storage
 
+    @staticmethod
+    def _backup_cloud_storage(
+        context: BackupContext, table: Table, backup_disks: MagicMock | None = None
+    ) -> None:
+        """Helper: copy data of a table through the pool and upload its metadata."""
+        with ThreadExecPool(1) as pool:
+            TableBackup._backup_cloud_storage_metadata(
+                context, pool, table, backup_disks
+            )
+            TableBackup._upload_cloud_storage_metadata(context, pool)
+
     def test_metadata_is_uploaded_from_the_disk_itself_without_copying(self):
         """
         Without backup disks nothing is copied and metadata is read from the
@@ -507,7 +521,7 @@ class TestBackupCloudStorageMetadata:
         disk = Disk("s3", "/var/lib/clickhouse/disks/s3/", "s3")
         context, layout, cloud_storage = self._make_context()
 
-        TableBackup._backup_cloud_storage_metadata(context, self._make_table([disk]))
+        self._backup_cloud_storage(context, self._make_table([disk]))
 
         upload_kwargs = layout.upload_cloud_storage_metadata.call_args.kwargs
         assert upload_kwargs["source_disk"] is None
@@ -525,7 +539,7 @@ class TestBackupCloudStorageMetadata:
         context, layout, cloud_storage = self._make_context()
         table = self._make_table([disk])
 
-        TableBackup._backup_cloud_storage_metadata(context, table, backup_disks)
+        self._backup_cloud_storage(context, table, backup_disks)
 
         backup_disks.copy_table_data.assert_called_once_with("s3", table)
         upload_kwargs = layout.upload_cloud_storage_metadata.call_args.kwargs
@@ -541,9 +555,7 @@ class TestBackupCloudStorageMetadata:
         backup_disks = MagicMock()
         context, layout, cloud_storage = self._make_context(has_frozen_data=False)
 
-        TableBackup._backup_cloud_storage_metadata(
-            context, self._make_table([disk]), backup_disks
-        )
+        self._backup_cloud_storage(context, self._make_table([disk]), backup_disks)
 
         backup_disks.copy_table_data.assert_not_called()
         layout.upload_cloud_storage_metadata.assert_not_called()
@@ -564,9 +576,7 @@ class TestBackupCloudStorageMetadata:
         )
 
         with pytest.raises(ClickhouseBackupError):
-            TableBackup._backup_cloud_storage_metadata(
-                context, self._make_table([disk]), backup_disks
-            )
+            self._backup_cloud_storage(context, self._make_table([disk]), backup_disks)
 
         layout.upload_cloud_storage_metadata.assert_not_called()
         cloud_storage.add_disk.assert_not_called()
@@ -579,9 +589,7 @@ class TestBackupCloudStorageMetadata:
         backup_disks = MagicMock()
         context, layout, _ = self._make_context()
 
-        TableBackup._backup_cloud_storage_metadata(
-            context, self._make_table([disk]), backup_disks
-        )
+        self._backup_cloud_storage(context, self._make_table([disk]), backup_disks)
 
         backup_disks.copy_table_data.assert_not_called()
         layout.upload_cloud_storage_metadata.assert_not_called()
@@ -596,9 +604,150 @@ class TestBackupCloudStorageMetadata:
         backup_disks = MagicMock()
         context, layout, _ = self._make_context()
 
-        TableBackup._backup_cloud_storage_metadata(
-            context, self._make_table([disk]), backup_disks
-        )
+        self._backup_cloud_storage(context, self._make_table([disk]), backup_disks)
 
         backup_disks.copy_table_data.assert_not_called()
         layout.upload_cloud_storage_metadata.assert_not_called()
+
+
+class TestCloudStorageCopyPool:
+    """
+    Tests for parallel copying of cloud storage data into the backup.
+    """
+
+    _DISK = Disk("s3", "/var/lib/clickhouse/disks/s3/", "s3")
+    _BACKUP_DISK = Disk("s3_backup", "/var/lib/clickhouse/disks/s3_backup/", "s3")
+
+    @classmethod
+    def _make_tables(cls, count: int) -> list[Table]:
+        return [
+            Table(
+                "db1",
+                f"table{num}",
+                "MergeTree",
+                [cls._DISK],
+                [os.path.join(cls._DISK.path, f"store/abc/table{num}")],
+                f"/var/lib/clickhouse/metadata/db1/table{num}.sql",
+                "",
+                UUID,
+            )
+            for num in range(count)
+        ]
+
+    @classmethod
+    def _run_backup(
+        cls,
+        backup_disks: MagicMock,
+        table_count: int = 2,
+        ch_ctl: Mock | None = None,
+    ) -> BackupContext:
+        """Helper: back up tables storing their data on a cloud storage disk."""
+        config: dict = copy.deepcopy(DEFAULT_CONFIG)
+        config["cloud_storage"] = {"copy_data": True}
+        tables = cls._make_tables(table_count)
+
+        context = BackupContext(config)  # type: ignore[arg-type]
+        context.ch_ctl = ch_ctl or Mock()
+        context.ch_ctl.get_tables.return_value = tables
+        context.ch_ctl.get_disks.return_value = {}
+        context.ch_ctl.scan_frozen_parts.return_value = []
+        context.backup_layout = MagicMock()
+        context.backup_layout.has_frozen_cloud_storage_data.return_value = True
+        context.ch_config = MagicMock()
+        context.ch_config.config = {}
+        context.backup_meta = BackupMetadata(
+            name="20181017T210300",
+            path="ch_backup/20181017T210300",
+            version="1.0.100",
+            ch_version="19.1.16",
+            time_format="%Y-%m-%dT%H:%M:%S%Z",
+            hostname="clickhouse01.test_net_711",
+        )
+        db = Database(
+            "db1", "Atomic", "/var/lib/clickhouse/metadata/db1.sql", None, None
+        )
+        context.backup_meta.add_database(db)
+
+        change_time = Mock(
+            side_effect=lambda path: TableMetadataChangeTime(
+                path, mtime_ns=1, ctime_ns=1
+            )
+        )
+        with (
+            patch.object(TableBackup, "_get_change_time", change_time),
+            patch("ch_backup.logic.table.Path"),
+            patch("ch_backup.logic.table.ClickHouseBackupDisks") as backup_disks_class,
+        ):
+            backup_disks_class.return_value.__enter__.return_value = backup_disks
+            TableBackup().backup(
+                context,
+                [db],
+                {"db1": [table.name for table in tables]},
+                schema_only=False,
+                multiprocessing_config=config["multiprocessing"],
+            )
+
+        return context
+
+    def test_data_of_every_table_is_copied(self):
+        """
+        Every table is copied on its own, so that copies can go in parallel.
+        """
+        backup_disks = MagicMock()
+        backup_disks.copy_table_data.return_value = self._BACKUP_DISK
+
+        context = self._run_backup(backup_disks, table_count=3)
+
+        assert backup_disks.copy_table_data.call_count == 3
+        assert context.backup_layout.upload_cloud_storage_metadata.call_count == 3
+        assert context.backup_meta.cloud_storage.disks == ["s3"]
+
+    def test_copies_of_different_tables_run_in_parallel(self):
+        """
+        A copy must not wait for the previous one to complete.
+
+        Copies meet at a barrier, so a sequential implementation hangs there
+        until the barrier breaks by timeout.
+        """
+        barrier = threading.Barrier(2, timeout=10)
+        backup_disks = MagicMock()
+        backup_disks.copy_table_data.side_effect = lambda *_: (
+            barrier.wait(),
+            self._BACKUP_DISK,
+        )[1]
+
+        self._run_backup(backup_disks, table_count=2)
+
+        assert backup_disks.copy_table_data.call_count == 2
+
+    def test_freezed_data_is_removed_after_the_copies(self):
+        """
+        Removing frozen data of a database must wait for copies of its tables.
+        """
+        calls: list[str] = []
+        backup_disks = MagicMock()
+        backup_disks.copy_table_data.side_effect = lambda *_: (
+            calls.append("copy"),
+            self._BACKUP_DISK,
+        )[1]
+        ch_ctl = Mock()
+        ch_ctl.remove_freezed_data.side_effect = lambda *args: calls.append(
+            "remove_table" if args else "remove_all"
+        )
+
+        self._run_backup(backup_disks, table_count=2, ch_ctl=ch_ctl)
+
+        assert calls.count("copy") == 2
+        assert calls[-1] == "remove_all"
+
+    def test_failed_copy_fails_the_backup(self):
+        """
+        A copy failing in the pool must not be lost.
+        """
+        backup_disks = MagicMock()
+        backup_disks.copy_table_data.side_effect = ClickHouseDisksException(
+            "copy failed"
+        )
+
+        with pytest.raises(ClickHouseDisksException):
+            self._run_backup(backup_disks, table_count=2)
