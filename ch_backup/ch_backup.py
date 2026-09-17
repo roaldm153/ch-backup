@@ -263,7 +263,7 @@ class ClickhouseBackup:
             and sources.data
             and not skip_cloud_storage
         ):
-            if self._context.backup_meta.cloud_storage.enabled:
+            if self._context.backup_meta.cloud_storage.requires_source_bucket:
                 raise ClickhouseBackupError(
                     "Cloud storage source bucket must be set if backup has data on S3 disks"
                 )
@@ -577,6 +577,8 @@ class ClickhouseBackup:
                         backup, table, db_dedup_references[table.name]
                     )
 
+            if backup.cloud_storage.enabled:
+                self._context.backup_layout.delete_cloud_storage_data(backup.name)
             self._context.ch_ctl.system_unfreeze(backup.name)
             return (
                 None,
