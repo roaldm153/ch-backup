@@ -84,6 +84,26 @@ Feature: Full backup of cloud storage data
 
   @object_storage_copy
   @require_version_22.8
+  Scenario: Backup name occupied by its sanitized form is rejected
+    Given we have executed queries on clickhouse01
+    """
+    CREATE DATABASE IF NOT EXISTS test_db;
+    """
+    When we create clickhouse01 clickhouse backup
+    """
+    name: test_backup
+    """
+    And we try to execute command on clickhouse01
+    """
+    ch-backup -c /etc/yandex/ch-backup/ch-backup.conf backup --name test-backup
+    """
+    Then we get response contains
+    """
+    conflicts with existing backup test_backup
+    """
+
+  @object_storage_copy
+  @require_version_22.8
   Scenario: Restore without copied data still requires the source bucket
     Given we have executed queries on clickhouse01
     """

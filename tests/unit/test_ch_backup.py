@@ -121,6 +121,39 @@ def test_delete_removes_cloud_storage_data_that_is_not_referenced():
     layout.delete_cloud_storage_data.assert_called_once_with("backup")
 
 
+def _create_backup_next_to(existing_name: str, name: str) -> None:
+    """Helper: create a backup while another backup already exists."""
+    backup = ClickhouseBackup(DEFAULT_CONFIG)  # type: ignore[arg-type]
+    backup.__dict__["_context"] = MagicMock()
+
+    existing = MagicMock()
+    existing.name = existing_name
+    backup.__dict__["_context"].backup_layout.get_backups.return_value = [existing]
+
+    backup.backup(BackupSources(), name=name)
+
+
+def test_backup_rejects_an_existing_name():
+    """
+    A backup never overwrites another one.
+    """
+    with pytest.raises(ClickhouseBackupError) as exc:
+        _create_backup_next_to("test-backup", "test-backup")
+
+    assert "already exists" in str(exc.value)
+
+
+def test_backup_rejects_a_name_taken_by_its_sanitized_form():
+    """
+    ClickHouse writes cloud storage data under the sanitized name, so such a
+    backup would share the data path with the existing one.
+    """
+    with pytest.raises(ClickhouseBackupError) as exc:
+        _create_backup_next_to("test_backup", "test-backup")
+
+    assert "conflicts with existing backup test_backup" in str(exc.value)
+
+
 def _backup_with_context(
     database_engine: str = "Atomic", table_engine: str = "MergeTree"
 ) -> tuple[ClickhouseBackup, Mock]:

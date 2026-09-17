@@ -17,7 +17,12 @@ from ch_backup.backup.deduplication import (
     collect_dedup_info,
     collect_dedup_references_for_batch_backup_deletion,
 )
-from ch_backup.backup.metadata import BackupMetadata, BackupState, TableMetadata
+from ch_backup.backup.metadata import (
+    BackupMetadata,
+    BackupState,
+    TableMetadata,
+    sanitize_backup_name,
+)
 from ch_backup.backup.sources import BackupSources
 from ch_backup.backup_context import BackupContext
 from ch_backup.clickhouse.client import ClickhouseError
@@ -133,9 +138,16 @@ class ClickhouseBackup:
             use_light_meta=True
         )
 
+        sanitized_name = sanitize_backup_name(name)
         for backup in backups_with_light_meta:
             if name == backup.name:
                 raise ClickhouseBackupError(f"Backup with name {name} already exists")
+            if sanitized_name == sanitize_backup_name(backup.name):
+                raise ClickhouseBackupError(
+                    f"Backup with name {name} conflicts with existing backup "
+                    f"{backup.name}: names that differ only in '-' and '_' share "
+                    "the same cloud storage path"
+                )
 
         logging.info(f"Backup sources: {sources}")
         assert not (db_names and tables)
