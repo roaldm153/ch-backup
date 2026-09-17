@@ -470,3 +470,223 @@ Feature: Full backup of cloud storage data
     And we restore clickhouse backup #0 to clickhouse02
     Then the user's data equal to saved one on clickhouse02
     And data part checksums equal to saved ones on clickhouse02
+
+  @object_storage_copy
+  @require_version_24.1
+  Scenario: A backup that did not copy the data is not a source of links
+    Given we have executed queries on clickhouse01
+    """
+    CREATE DATABASE IF NOT EXISTS test_db;
+    CREATE TABLE test_db.table_s3 (
+        CounterID UInt32,
+        UserID    UInt32,
+        Payload   String
+    )
+    ENGINE = MergeTree()
+    PARTITION BY CounterID
+    ORDER BY UserID
+    SETTINGS storage_policy = 's3';
+
+    INSERT INTO test_db.table_s3 SELECT 0, number, repeat('a', 256) FROM system.numbers LIMIT 1000;
+    INSERT INTO test_db.table_s3 SELECT 1, number, repeat('b', 256) FROM system.numbers LIMIT 1000;
+    INSERT INTO test_db.table_s3 SELECT 2, number, repeat('c', 256) FROM system.numbers LIMIT 1000;
+    """
+    When we create clickhouse01 clickhouse backup
+    """
+    name: test_backup1
+    """
+    And we save all user's data in context on clickhouse01
+    And we save data part checksums in context on clickhouse01
+    And we create clickhouse01 clickhouse backup
+    """
+    name: test_backup2
+    copy_cloud_storage_data: true
+    """
+    # The first backup left the data in the source bucket. Linking to it would
+    # make the second backup unrestorable as soon as that bucket is gone, which
+    # is exactly what the rest of the scenario does.
+    Then we got the following backups on clickhouse01
+      | num | state   | data_count | link_count |
+      | 0   | created | 3          | 0          |
+      | 1   | created | 3          | 0          |
+    And s3 bucket ch-backup contains objects with prefix "ch_backup/test_backup2/cloud_storage/s3/"
+    When we delete all objects in s3 bucket cloud-storage-01
+    And we restore clickhouse backup #0 to clickhouse02
+    Then the user's data equal to saved one on clickhouse02
+    And data part checksums equal to saved ones on clickhouse02
+
+  @object_storage_copy
+  @require_version_24.1
+  Scenario: Restore of the third backup in a chain of deduplicated parts
+    Given we have executed queries on clickhouse01
+    """
+    CREATE DATABASE IF NOT EXISTS test_db;
+    CREATE TABLE test_db.table_s3 (
+        CounterID UInt32,
+        UserID    UInt32,
+        Payload   String
+    )
+    ENGINE = MergeTree()
+    PARTITION BY CounterID
+    ORDER BY UserID
+    SETTINGS storage_policy = 's3';
+
+    INSERT INTO test_db.table_s3 SELECT 0, number, repeat('a', 256) FROM system.numbers LIMIT 1000;
+    INSERT INTO test_db.table_s3 SELECT 1, number, repeat('b', 256) FROM system.numbers LIMIT 1000;
+    INSERT INTO test_db.table_s3 SELECT 2, number, repeat('c', 256) FROM system.numbers LIMIT 1000;
+    """
+    When we create clickhouse01 clickhouse backup
+    """
+    name: test_backup1
+    copy_cloud_storage_data: true
+    """
+    And we execute queries on clickhouse01
+    """
+    ALTER TABLE test_db.table_s3
+    UPDATE Payload = repeat('z', 256) WHERE CounterID = 0
+    SETTINGS mutations_sync = 2;
+    """
+    And we create clickhouse01 clickhouse backup
+    """
+    name: test_backup2
+    copy_cloud_storage_data: true
+    """
+    And we execute queries on clickhouse01
+    """
+    ALTER TABLE test_db.table_s3
+    UPDATE Payload = repeat('y', 256) WHERE CounterID = 1
+    SETTINGS mutations_sync = 2;
+    """
+    And we save all user's data in context on clickhouse01
+    And we save data part checksums in context on clickhouse01
+    And we create clickhouse01 clickhouse backup
+    """
+    name: test_backup3
+    copy_cloud_storage_data: true
+    """
+    # Every mutation renames the parts of untouched partitions, so the part of
+    # partition 2 is two renames away from its data in the first backup. The
+    # third backup links to two backups at once: partition 0 to the second one,
+    # partition 2 to the first one.
+    Then we got the following backups on clickhouse01
+      | num | state   | data_count | link_count |
+      | 0   | created | 1          | 2          |
+      | 1   | created | 1          | 2          |
+      | 2   | created | 3          | 0          |
+    And s3 bucket ch-backup contains objects with prefix "ch_backup/test_backup1/cloud_storage/s3/"
+    And s3 bucket ch-backup contains objects with prefix "ch_backup/test_backup2/cloud_storage/s3/"
+    When we delete all objects in s3 bucket cloud-storage-01
+    And we restore clickhouse backup "test_backup3" to clickhouse02
+    Then the user's data equal to saved one on clickhouse02
+    And data part checksums equal to saved ones on clickhouse02
+
+  @object_storage_copy
+  @require_version_24.1
+  Scenario: Purge keeps cloud storage data linked by a retained backup
+    Given ch-backup configuration on clickhouse01
+    """
+    backup:
+        retain_count: 1
+    """
+    And we have executed queries on clickhouse01
+    """
+    CREATE DATABASE IF NOT EXISTS test_db;
+    CREATE TABLE test_db.table_s3 (
+        CounterID UInt32,
+        UserID    UInt32,
+        Payload   String
+    )
+    ENGINE = MergeTree()
+    PARTITION BY CounterID
+    ORDER BY UserID
+    SETTINGS storage_policy = 's3';
+
+    INSERT INTO test_db.table_s3 SELECT 0, number, repeat('a', 256) FROM system.numbers LIMIT 1000;
+    INSERT INTO test_db.table_s3 SELECT 1, number, repeat('b', 256) FROM system.numbers LIMIT 1000;
+    INSERT INTO test_db.table_s3 SELECT 2, number, repeat('c', 256) FROM system.numbers LIMIT 1000;
+    """
+    When we create clickhouse01 clickhouse backup
+    """
+    name: test_backup1
+    copy_cloud_storage_data: true
+    """
+    And we create clickhouse01 clickhouse backup
+    """
+    name: test_backup2
+    copy_cloud_storage_data: true
+    """
+    And we save all user's data in context on clickhouse01
+    And we save data part checksums in context on clickhouse01
+    And we create clickhouse01 clickhouse backup
+    """
+    name: test_backup3
+    copy_cloud_storage_data: true
+    """
+    And we purge clickhouse01 clickhouse backups
+    # The retained backup holds nothing but links, so the data of the purged
+    # first backup has to outlive it.
+    Then we got the following backups on clickhouse01
+      | num | state             | data_count | link_count |
+      | 0   | created           | 0          | 3          |
+      | 1   | partially_deleted | 3          | 0          |
+    And s3 bucket ch-backup contains objects with prefix "ch_backup/test_backup1/cloud_storage/s3/"
+    When we delete all objects in s3 bucket cloud-storage-01
+    And we restore clickhouse backup "test_backup3" to clickhouse02
+    Then the user's data equal to saved one on clickhouse02
+    And data part checksums equal to saved ones on clickhouse02
+    When we delete clickhouse01 clickhouse backup "test_backup3"
+    """
+    purge_partial: true
+    """
+    Then we got no backups on clickhouse01
+    And s3 bucket ch-backup contains no objects with prefix "ch_backup/test_backup1/"
+
+  @object_storage_copy
+  @require_version_24.1
+  Scenario: Data of several tables is copied in parallel
+    Given ch-backup configuration on clickhouse01
+    """
+    multiprocessing:
+        cloud_storage_backup_workers: 4
+    """
+    And we have executed queries on clickhouse01
+    """
+    CREATE DATABASE IF NOT EXISTS test_db;
+
+    CREATE TABLE test_db.table_01 (CounterID UInt32, UserID UInt32, Payload String)
+    ENGINE = MergeTree() ORDER BY UserID SETTINGS storage_policy = 's3';
+    CREATE TABLE test_db.table_02 (CounterID UInt32, UserID UInt32, Payload String)
+    ENGINE = MergeTree() ORDER BY UserID SETTINGS storage_policy = 's3';
+    CREATE TABLE test_db.table_03 (CounterID UInt32, UserID UInt32, Payload String)
+    ENGINE = MergeTree() ORDER BY UserID SETTINGS storage_policy = 's3';
+    CREATE TABLE test_db.table_04 (CounterID UInt32, UserID UInt32, Payload String)
+    ENGINE = MergeTree() ORDER BY UserID SETTINGS storage_policy = 's3';
+    CREATE TABLE test_db.table_05 (CounterID UInt32, UserID UInt32, Payload String)
+    ENGINE = MergeTree() ORDER BY UserID SETTINGS storage_policy = 's3';
+    CREATE TABLE test_db.table_06 (CounterID UInt32, UserID UInt32, Payload String)
+    ENGINE = MergeTree() ORDER BY UserID SETTINGS storage_policy = 's3';
+
+    INSERT INTO test_db.table_01 SELECT 1, number, repeat('a', 256) FROM system.numbers LIMIT 500;
+    INSERT INTO test_db.table_02 SELECT 2, number, repeat('b', 256) FROM system.numbers LIMIT 500;
+    INSERT INTO test_db.table_03 SELECT 3, number, repeat('c', 256) FROM system.numbers LIMIT 500;
+    INSERT INTO test_db.table_04 SELECT 4, number, repeat('d', 256) FROM system.numbers LIMIT 500;
+    INSERT INTO test_db.table_05 SELECT 5, number, repeat('e', 256) FROM system.numbers LIMIT 500;
+    INSERT INTO test_db.table_06 SELECT 6, number, repeat('f', 256) FROM system.numbers LIMIT 500;
+    """
+    # Copies of several tables share one temporary disk, and this is the only
+    # scenario where more than one of them is created at a time.
+    When we save all user's data in context on clickhouse01
+    And we save data part checksums in context on clickhouse01
+    And we create clickhouse01 clickhouse backup
+    """
+    name: test_backup
+    copy_cloud_storage_data: true
+    """
+    Then we got the following backups on clickhouse01
+      | num | state   | data_count | link_count |
+      | 0   | created | 6          | 0          |
+    And s3 bucket ch-backup contains objects with prefix "ch_backup/test_backup/cloud_storage/s3/"
+    When we delete all objects in s3 bucket cloud-storage-01
+    And we restore clickhouse backup #0 to clickhouse02
+    Then the user's data equal to saved one on clickhouse02
+    And data part checksums equal to saved ones on clickhouse02
