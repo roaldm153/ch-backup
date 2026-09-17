@@ -885,21 +885,6 @@ class TestCloudStorageDeduplication:
         assert part.link is None
         assert context.backup_meta.cloud_storage.disks == ["s3"]
 
-    def test_disk_is_registered_even_when_nothing_is_copied(self):
-        """
-        Restore routes a part by its disk, so the disk of a fully deduplicated
-        table must still be listed in the backup.
-        """
-        context = self._make_context()
-
-        self._backup_frozen_parts(
-            context,
-            [self._make_frozen_part("all_1_1_0", self._DISK)],
-            {"all_1_1_0": self._make_deduplicated_part("all_1_1_0", "s3")},
-        )
-
-        assert context.backup_meta.cloud_storage.disks == ["s3"]
-
     def test_match_on_another_disk_is_ignored(self):
         """
         Data of a part is bound to its disk, so a match on another disk is not

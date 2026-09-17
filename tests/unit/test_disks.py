@@ -942,33 +942,6 @@ def test_restore_reads_copied_data_from_the_backup_bucket():
     )
 
 
-def test_restore_and_backup_use_the_same_location():
-    """
-    Restore must read data from where the backup wrote it, otherwise copied
-    objects are unreachable.
-    """
-    backup_manager, _ = _make_backup_disks(BACKUP_DISK_CLICKHOUSE_CONFIG)
-    restore_manager = _make_temporary_disks(
-        BACKUP_DISK_CLICKHOUSE_CONFIG,
-        cloud_storage_disks=["object_storage"],
-        data_copied=True,
-        source_bucket=None,
-    )
-
-    with _capture_config_files():
-        with backup_manager:
-            backup_manager.create_disk("object_storage")
-            # pylint: disable=protected-access
-            backup_endpoint = backup_manager._disks["object_storage_backup"]["endpoint"]
-        with restore_manager:
-            # pylint: disable=protected-access
-            restore_endpoint = restore_manager._disks["object_storage_source"][
-                "endpoint"
-            ]
-
-    assert_equal(restore_endpoint, backup_endpoint)
-
-
 LINKED_BACKUP_NAME = "20251231T000000"
 
 

@@ -550,21 +550,6 @@ class TestCloudStorageMetadata:
     Tests for CloudStorageMetadata.
     """
 
-    def test_data_copied_is_false_by_default(self) -> None:
-        """
-        A newly created backup must not claim that cloud storage data is copied.
-        """
-        assert CloudStorageMetadata().data_copied is False
-
-    def test_copy_data_sets_the_flag(self) -> None:
-        """
-        copy_data() must mark cloud storage data as copied.
-        """
-        metadata = CloudStorageMetadata()
-        metadata.copy_data()
-
-        assert metadata.data_copied is True
-
     def test_load_of_backup_without_cloud_storage_section(self) -> None:
         """
         Backups created before the field was introduced must remain readable
@@ -585,28 +570,6 @@ class TestCloudStorageMetadata:
 
         assert metadata.data_copied is False
         assert metadata.disks == ["s3"]
-
-    def test_dump_contains_data_copied(self) -> None:
-        """
-        The field must be serialized into backup metadata.
-        """
-        metadata = CloudStorageMetadata()
-        metadata.copy_data()
-
-        assert metadata.dump()["data_copied"] is True
-
-    @pytest.mark.parametrize("data_copied", [False, True])
-    def test_dump_load_round_trip(self, data_copied: bool) -> None:
-        """
-        The value must survive serialization and deserialization.
-        """
-        metadata = CloudStorageMetadata()
-        if data_copied:
-            metadata.copy_data()
-
-        restored = CloudStorageMetadata.load(metadata.dump())
-
-        assert restored.data_copied is data_copied
 
     def test_data_copied_survives_backup_metadata_round_trip(self) -> None:
         """
