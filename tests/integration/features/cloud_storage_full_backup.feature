@@ -271,3 +271,182 @@ Feature: Full backup of cloud storage data
     When we restore clickhouse backup #0 to clickhouse02
     Then clickhouse02 has same schema as clickhouse01
     And on clickhouse02 tables are empty
+
+  @object_storage_copy
+  @require_version_24.1
+  Scenario: Repeated backup of an unchanged table copies no data
+    Given we have executed queries on clickhouse01
+    """
+    CREATE DATABASE IF NOT EXISTS test_db;
+    CREATE TABLE test_db.table_s3 (
+        CounterID UInt32,
+        UserID    UInt32,
+        Payload   String
+    )
+    ENGINE = MergeTree()
+    PARTITION BY CounterID
+    ORDER BY UserID
+    SETTINGS storage_policy = 's3';
+
+    INSERT INTO test_db.table_s3 SELECT 0, number, repeat('a', 256) FROM system.numbers LIMIT 1000;
+    INSERT INTO test_db.table_s3 SELECT 1, number, repeat('b', 256) FROM system.numbers LIMIT 1000;
+    INSERT INTO test_db.table_s3 SELECT 2, number, repeat('c', 256) FROM system.numbers LIMIT 1000;
+    """
+    When we create clickhouse01 clickhouse backup
+    """
+    name: test_backup1
+    copy_cloud_storage_data: true
+    """
+    And we save all user's data in context on clickhouse01
+    And we save data part checksums in context on clickhouse01
+    And we create clickhouse01 clickhouse backup
+    """
+    name: test_backup2
+    copy_cloud_storage_data: true
+    """
+    Then we got the following backups on clickhouse01
+      | num | state   | data_count | link_count |
+      | 0   | created | 0          | 3          |
+      | 1   | created | 3          | 0          |
+    And s3 bucket ch-backup contains no objects with prefix "ch_backup/test_backup2/cloud_storage/"
+    When we delete all objects in s3 bucket cloud-storage-01
+    And we restore clickhouse backup #0 to clickhouse02
+    Then the user's data equal to saved one on clickhouse02
+    And data part checksums equal to saved ones on clickhouse02
+
+  @object_storage_copy
+  @require_version_24.1
+  Scenario: Deleting a backup keeps data reused by a later one
+    Given we have executed queries on clickhouse01
+    """
+    CREATE DATABASE IF NOT EXISTS test_db;
+    CREATE TABLE test_db.table_s3 (
+        CounterID UInt32,
+        UserID    UInt32,
+        Payload   String
+    )
+    ENGINE = MergeTree()
+    PARTITION BY CounterID
+    ORDER BY UserID
+    SETTINGS storage_policy = 's3';
+
+    INSERT INTO test_db.table_s3 SELECT 0, number, repeat('a', 256) FROM system.numbers LIMIT 1000;
+    INSERT INTO test_db.table_s3 SELECT 1, number, repeat('b', 256) FROM system.numbers LIMIT 1000;
+    """
+    When we create clickhouse01 clickhouse backup
+    """
+    name: test_backup1
+    copy_cloud_storage_data: true
+    """
+    And we save all user's data in context on clickhouse01
+    And we save data part checksums in context on clickhouse01
+    And we create clickhouse01 clickhouse backup
+    """
+    name: test_backup2
+    copy_cloud_storage_data: true
+    """
+    And we delete clickhouse01 clickhouse backup #1
+    Then we got the following backups on clickhouse01
+      | num | state             | data_count | link_count |
+      | 0   | created           | 0          | 2          |
+      | 1   | partially_deleted | 2          | 0          |
+    And s3 bucket ch-backup contains objects with prefix "ch_backup/test_backup1/cloud_storage/s3/"
+    When we delete all objects in s3 bucket cloud-storage-01
+    And we restore clickhouse backup #0 to clickhouse02
+    Then the user's data equal to saved one on clickhouse02
+    And data part checksums equal to saved ones on clickhouse02
+
+  @object_storage_copy
+  @require_version_24.1
+  Scenario: Deduplicated parts leave no objects behind when the table is dropped
+    Given we have executed queries on clickhouse01
+    """
+    CREATE DATABASE IF NOT EXISTS test_db;
+    CREATE TABLE test_db.table_s3 (
+        CounterID UInt32,
+        UserID    UInt32,
+        Payload   String
+    )
+    ENGINE = MergeTree()
+    PARTITION BY CounterID
+    ORDER BY UserID
+    SETTINGS storage_policy = 's3';
+
+    INSERT INTO test_db.table_s3 SELECT 0, number, repeat('a', 256) FROM system.numbers LIMIT 1000;
+    INSERT INTO test_db.table_s3 SELECT 1, number, repeat('b', 256) FROM system.numbers LIMIT 1000;
+    """
+    When we create clickhouse01 clickhouse backup
+    """
+    name: test_backup1
+    copy_cloud_storage_data: true
+    """
+    And we create clickhouse01 clickhouse backup
+    """
+    name: test_backup2
+    copy_cloud_storage_data: true
+    """
+    # Without this check the scenario stays green when nothing was deduplicated.
+    Then we got the following backups on clickhouse01
+      | num | state   | data_count | link_count |
+      | 0   | created | 0          | 2          |
+      | 1   | created | 2          | 0          |
+    # Frozen data of a live backup holds the objects, so both backups go first.
+    # Deleting one releases only the references it still has: the reference of a
+    # deduplicated part was dropped at backup time and has to have been dropped
+    # through the disk, or the count stays incremented and DROP leaks objects.
+    When we delete clickhouse01 clickhouse backup "test_backup2"
+    And we delete clickhouse01 clickhouse backup "test_backup1"
+    And we execute queries on clickhouse01
+    """
+    DROP TABLE test_db.table_s3 SYNC;
+    """
+    Then s3 bucket cloud-storage-01 contains 0 objects
+
+  @object_storage_copy
+  @require_version_24.1
+  Scenario: Restore of a backup made after a mutation renaming parts
+    Given we have executed queries on clickhouse01
+    """
+    CREATE DATABASE IF NOT EXISTS test_db;
+    CREATE TABLE test_db.table_s3 (
+        CounterID UInt32,
+        UserID    UInt32,
+        Payload   String
+    )
+    ENGINE = MergeTree()
+    PARTITION BY CounterID
+    ORDER BY UserID
+    SETTINGS storage_policy = 's3';
+
+    INSERT INTO test_db.table_s3 SELECT 0, number, repeat('a', 256) FROM system.numbers LIMIT 1000;
+    INSERT INTO test_db.table_s3 SELECT 1, number, repeat('b', 256) FROM system.numbers LIMIT 1000;
+    INSERT INTO test_db.table_s3 SELECT 2, number, repeat('c', 256) FROM system.numbers LIMIT 1000;
+    """
+    When we create clickhouse01 clickhouse backup
+    """
+    name: test_backup1
+    copy_cloud_storage_data: true
+    """
+    # Parts of untouched partitions keep their data and get a mutation suffix,
+    # which is the case deduplication has to see through.
+    And we execute queries on clickhouse01
+    """
+    ALTER TABLE test_db.table_s3
+    UPDATE Payload = repeat('z', 256) WHERE CounterID = 0
+    SETTINGS mutations_sync = 2;
+    """
+    And we save all user's data in context on clickhouse01
+    And we save data part checksums in context on clickhouse01
+    And we create clickhouse01 clickhouse backup
+    """
+    name: test_backup2
+    copy_cloud_storage_data: true
+    """
+    Then we got the following backups on clickhouse01
+      | num | state   | data_count | link_count |
+      | 0   | created | 1          | 2          |
+      | 1   | created | 3          | 0          |
+    When we delete all objects in s3 bucket cloud-storage-01
+    And we restore clickhouse backup #0 to clickhouse02
+    Then the user's data equal to saved one on clickhouse02
+    And data part checksums equal to saved ones on clickhouse02

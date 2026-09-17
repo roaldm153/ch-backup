@@ -11,7 +11,7 @@ from contextlib import contextmanager, suppress
 from hashlib import md5
 from pathlib import Path
 from tarfile import BLOCKSIZE  # type: ignore
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from ch_backup import logging
 from ch_backup.backup.metadata import TableMetadata
@@ -1219,11 +1219,13 @@ class ClickhouseCTL:
             logging.debug("Shadow path {} is empty", path)
             return
 
+        part_checksum = _get_part_checksum_calculator(disk)
+
         for dir_entry in os.scandir(path):
             part = dir_entry.name
             part_path = dir_entry.path
-            checksum = _get_part_checksum(part_path)
             rel_paths = list_dir_files(part_path)
+            checksum = part_checksum(part_path, rel_paths)
             abs_paths = [Path(part_path) / file for file in rel_paths]
 
             size = calc_aligned_files_size(abs_paths, alignment=BLOCKSIZE)
@@ -1587,9 +1589,57 @@ class ClickhouseCTL:
         )
 
 
-def _get_part_checksum(part_path: str) -> str:
+PartChecksumCalculator = Callable[[str, Sequence[str]], str]
+
+
+def _get_part_checksum_calculator(disk: Disk) -> PartChecksumCalculator:
+    """
+    Choose how checksums of parts on the disk are calculated.
+    """
+    if disk.keeps_object_metadata:
+        return _get_cloud_part_checksum
+    return _get_part_checksum
+
+
+def _get_part_checksum(part_path: str, _rel_paths: Sequence[str]) -> str:
+    """
+    Calculate checksum of a part stored on a local disk.
+    """
     with open(os.path.join(part_path, "checksums.txt"), "rb") as f:
         return md5(f.read()).hexdigest()  # nosec
+
+
+def _get_cloud_part_checksum(part_path: str, rel_paths: Sequence[str]) -> str:
+    """
+    Calculate checksum of a part stored on an object storage disk.
+
+    Files of such a part are metadata referring to objects with random keys.
+    ClickHouse rewrites the metadata on every freeze, so the keys are what
+    identifies the data of the part.
+    """
+    checksum = md5()  # nosec
+    for rel_path in sorted(rel_paths):
+        checksum.update(rel_path.encode())
+        for object_key in _read_object_keys(os.path.join(part_path, rel_path)):
+            checksum.update(object_key.encode())
+
+    return checksum.hexdigest()
+
+
+def _read_object_keys(metadata_path: str) -> list[str]:
+    """
+    Read keys of the objects a disk metadata file refers to.
+    """
+    with open(metadata_path, encoding="utf-8") as f:
+        version = f.readline().strip()
+        try:
+            objects_count = int(f.readline().split("\t")[0])
+            return [f.readline().split("\t")[1].strip() for _ in range(objects_count)]
+        except (IndexError, ValueError) as e:
+            raise ClickhouseBackupError(
+                f"Failed to read object keys of {metadata_path},"
+                f" metadata version {version}"
+            ) from e
 
 
 def _format_string_array(value: Sequence[str]) -> str:

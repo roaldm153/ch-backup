@@ -803,6 +803,20 @@ class BackupLayout:
             os.makedirs(path, exist_ok=True)
             yield path
 
+    def has_cloud_storage_metadata(
+        self, backup_name: str, database: str, table: str, disk_name: str
+    ) -> bool:
+        """
+        Check that disk metadata of a table is stored in a backup.
+        """
+        backup_path = self.get_cloud_storage_path(backup_name)
+        return any(
+            self._storage_loader.path_exists(
+                _disk_metadata_path(backup_path, database, table, disk_name, compressed)
+            )
+            for compressed in (True, False)
+        )
+
     def cloud_storage_metadata_exists(
         self, backup_meta: BackupMetadata, disk: Disk
     ) -> bool:
@@ -870,24 +884,30 @@ class BackupLayout:
         deleting_files = list(
             self._storage_loader.list_dir(backup_path, recursive=True, absolute=True)
         )
-        cloud_storage_path = self.get_cloud_storage_path(backup_name)
-        if cloud_storage_path != backup_path:
-            logging.debug("Deleting cloud storage data in {}", cloud_storage_path)
-            deleting_files += self._storage_loader.list_dir(
-                cloud_storage_path, recursive=True, absolute=True
-            )
+        if self.get_cloud_storage_path(backup_name) != backup_path:
+            deleting_files += self._list_cloud_storage_files(backup_name)
         self._delete_files(deleting_files)
 
     def delete_cloud_storage_data(self, backup_name: str) -> None:
         """
         Delete cloud storage metadata and copied data of a backup.
 
-        Cloud storage data is never shared between backups, so it can be deleted
-        even when the rest of the backup is kept.
+        Data of a whole backup is deleted at once, so the caller must be sure
+        that no other backup reuses parts of it.
+        """
+        logging.debug("Deleting cloud storage data of backup {}", backup_name)
+
+        self._delete_files(self._list_cloud_storage_files(backup_name))
+
+    def _list_cloud_storage_files(self, backup_name: str) -> list[str]:
+        """
+        List cloud storage metadata and copied data of a backup.
+
+        Only the two directories are listed, never the whole path: it is formed
+        from the sanitized backup name and may belong to another backup whose
+        name differs only in the characters that get sanitized.
         """
         cloud_storage_path = self.get_cloud_storage_path(backup_name)
-
-        logging.debug("Deleting cloud storage data of backup {}", backup_name)
 
         deleting_files: list[str] = []
         for directory in (
@@ -897,7 +917,7 @@ class BackupLayout:
             deleting_files += self._storage_loader.list_dir(
                 directory, recursive=True, absolute=True
             )
-        self._delete_files(deleting_files)
+        return deleting_files
 
     def delete_data_parts(
         self, backup_meta: BackupMetadata, parts: Sequence[PartMetadata]

@@ -158,6 +158,54 @@ class TestCloudStorageMetadataUpload:
         )
 
 
+class TestCloudStorageMetadataLookup:
+    """Tests for the lookup of disk metadata of a table in a backup."""
+
+    # pylint: disable=protected-access
+
+    @staticmethod
+    def _probed_paths(layout: BackupLayout) -> list:
+        """Helper: return paths the lookup checked for existence."""
+        return [
+            call.args[0] for call in layout._storage_loader.path_exists.call_args_list
+        ]
+
+    def test_dashed_backup_name_is_looked_up_under_the_sanitized_path(self):
+        """
+        Disk metadata is uploaded under the sanitized backup name, so looking it
+        up by the raw name would never find it and deduplication would be lost.
+        """
+        layout = make_layout()
+        layout._storage_loader.path_exists.return_value = False
+
+        layout.has_cloud_storage_metadata("my-backup", "db1", "table1", "s3")
+
+        assert self._probed_paths(layout) == [
+            "ch_backup/my_backup/disks/s3/db1/table1.tar.gz",
+            "ch_backup/my_backup/disks/s3/db1/table1.tar",
+        ]
+
+    def test_metadata_is_found_when_stored_uncompressed(self):
+        """
+        Either extension means the metadata is there.
+        """
+        layout = make_layout()
+        layout._storage_loader.path_exists.side_effect = {
+            "ch_backup/my_backup/disks/s3/db1/table1.tar": True
+        }.get
+
+        assert layout.has_cloud_storage_metadata("my-backup", "db1", "table1", "s3")
+
+    def test_missing_metadata_is_reported(self):
+        """
+        A backup without the metadata of the table cannot be linked to.
+        """
+        layout = make_layout()
+        layout._storage_loader.path_exists.return_value = False
+
+        assert not layout.has_cloud_storage_metadata("my-backup", "db1", "table1", "s3")
+
+
 class TestCloudStorageDataDeletion:
     """Tests for deletion of cloud storage data of a backup."""
 
@@ -185,7 +233,33 @@ class TestCloudStorageDataDeletion:
 
         assert delete_files.call_args.args[0] == [
             "ch_backup/my-backup/object",
-            "ch_backup/my_backup/object",
+            "ch_backup/my_backup/disks/object",
+            "ch_backup/my_backup/cloud_storage/object",
+        ]
+
+    def test_delete_backup_keeps_a_backup_named_as_the_sanitized_path(self):
+        """
+        Names differing only in '-' share the sanitized path, so listing it as a
+        whole would delete metadata and data parts of the other backup.
+        """
+        layout = make_layout()
+        layout._storage_loader.list_dir.side_effect = lambda path, **_kwargs: {
+            "ch_backup/my-backup": ["ch_backup/my-backup/backup_struct.json"],
+            "ch_backup/my_backup": [
+                "ch_backup/my_backup/backup_struct.json",
+                "ch_backup/my_backup/data/db/table/part.tar",
+                "ch_backup/my_backup/disks/s3/db/table.tar",
+            ],
+            "ch_backup/my_backup/disks": ["ch_backup/my_backup/disks/s3/db/table.tar"],
+        }.get(path, [])
+        delete_files = MagicMock()
+        setattr(layout, "_delete_files", delete_files)
+
+        layout.delete_backup("my-backup")
+
+        assert delete_files.call_args.args[0] == [
+            "ch_backup/my-backup/backup_struct.json",
+            "ch_backup/my_backup/disks/s3/db/table.tar",
         ]
 
     def test_delete_backup_without_dashes_deletes_the_path_once(self):
@@ -200,8 +274,8 @@ class TestCloudStorageDataDeletion:
 
     def test_delete_cloud_storage_data_keeps_the_rest_of_the_backup(self):
         """
-        Partially deleted backup keeps data parts shared with newer backups, but
-        its cloud storage data is never shared and must go.
+        Partially deleted backup keeps data parts shared with newer backups,
+        while its cloud storage data is deleted whole, under both names.
         """
         layout, delete_files = self._make_layout()
 

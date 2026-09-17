@@ -12,11 +12,13 @@ import unittest
 import unittest.mock
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Iterator
+from typing import IO, Iterator, Sequence
 
+import pytest
 import xmltodict
 
 from ch_backup.backup.layout import BackupLayout
+from ch_backup.backup.metadata import PartMetadata
 from ch_backup.backup_context import BackupContext
 from ch_backup.clickhouse.config import ClickhouseConfig
 from ch_backup.clickhouse.disks import (
@@ -27,7 +29,7 @@ from ch_backup.clickhouse.disks import (
     _open_config_file,
     _render_disks_config,
 )
-from ch_backup.clickhouse.models import Disk, Table
+from ch_backup.clickhouse.models import Disk, FrozenPart, Table
 from ch_backup.config import DEFAULT_CONFIG, Config
 from tests.unit.utils import assert_equal, parametrize
 
@@ -259,21 +261,43 @@ def _make_context(config: dict, clickhouse_config_xml: str) -> BackupContext:
     return context
 
 
+def _make_linked_backup_meta(backup_name: str) -> unittest.mock.MagicMock:
+    """Helper: mock metadata of a backup holding data of deduplicated parts."""
+    backup_meta = unittest.mock.MagicMock()
+    backup_meta.name = backup_name
+    backup_meta.get_sanitized_name.return_value = backup_name
+    backup_meta.cloud_storage.data_copied = True
+    return backup_meta
+
+
+# pylint: disable=too-many-positional-arguments
 def _make_temporary_disks(
     clickhouse_config_xml: str,
     cloud_storage_disks: list[str] | None = None,
     data_copied: bool = False,
     source_bucket: str | None = "test-bucket",
+    parts: Sequence[PartMetadata] = (),
 ) -> ClickHouseTemporaryDisks:
     """Helper: build ClickHouseTemporaryDisks with mocked dependencies."""
     context = _make_context(_make_backup_storage_config(), clickhouse_config_xml)
     context.backup_layout = _make_backup_layout(_make_backup_storage_config())
+    context.backup_layout.get_backup.side_effect = lambda name, **_: (
+        _make_linked_backup_meta(name)
+    )
     context.backup_meta.cloud_storage.disks = cloud_storage_disks or []
     context.backup_meta.cloud_storage.enabled = bool(cloud_storage_disks)
     context.backup_meta.cloud_storage.data_copied = data_copied
     context.backup_meta.cloud_storage.requires_source_bucket = (
         bool(cloud_storage_disks) and not data_copied
     )
+
+    table = unittest.mock.MagicMock()
+    table.database = "db1"
+    table.name = "table1"
+    table.get_parts.return_value = list(parts)
+    context.backup_meta.get_databases.return_value = ["db1"]
+    context.backup_meta.get_tables.return_value = [table]
+
     return ClickHouseTemporaryDisks(
         context.ch_ctl,
         context.backup_layout,
@@ -409,7 +433,7 @@ def _capture_config_files() -> Iterator[tuple[dict[str, str], unittest.mock.Magi
     def collect(path: str) -> Iterator[IO[str]]:
         buffer = io.StringIO()
         yield buffer
-        written[path] = written.get(path, "") + buffer.getvalue()
+        written[path] = buffer.getvalue()
 
     with unittest.mock.patch(
         "ch_backup.clickhouse.disks._open_config_file", new=collect
@@ -742,6 +766,124 @@ def test_copy_table_data_copies_frozen_shadow_directory():
     )
 
 
+def _remove_frozen_part(
+    part_path: str, new_disks_interface: bool = True
+) -> unittest.mock.MagicMock:
+    """Helper: remove a frozen part of a disk and return the mocked call."""
+    disk_manager, ch_ctl = _make_backup_disks(BACKUP_DISK_CLICKHOUSE_CONFIG)
+    ch_ctl.ch_version_ge.return_value = new_disks_interface
+    source_disk = Disk("object_storage", "/var/lib/clickhouse/disks/s3/", "s3")
+    part = FrozenPart(
+        "db1", "table1", "all_1_1_0", "object_storage", part_path, "checksum", 1024, []
+    )
+
+    with _capture_config_files():
+        with unittest.mock.patch("ch_backup.clickhouse.disks._exec") as exec_mock:
+            with unittest.mock.patch("shutil.rmtree"):
+                with disk_manager:
+                    disk_manager.remove_frozen_part(source_disk, part)
+
+    return exec_mock
+
+
+def test_remove_frozen_part_goes_through_the_disk():
+    """
+    The reference count kept in the metadata of the objects is decremented
+    only when the part is removed through the disk.
+    """
+    exec_mock = _remove_frozen_part(
+        "/var/lib/clickhouse/disks/s3/shadow/20260101T000000/store/abc/abcdef/all_1_1_0"
+    )
+
+    assert exec_mock.call_args.kwargs["command"].endswith("remove")
+    assert "object_storage" in exec_mock.call_args.kwargs["common_args"]
+    assert (
+        "shadow/20260101T000000/store/abc/abcdef/all_1_1_0"
+        in exec_mock.call_args.kwargs["command_args"]
+    )
+
+
+def test_remove_frozen_part_is_recursive_in_the_new_disks_interface():
+    """
+    Removal of a directory has to be asked for explicitly since 24.7.
+    """
+    path = (
+        "/var/lib/clickhouse/disks/s3/shadow/20260101T000000/store/abc/abcdef/all_1_1_0"
+    )
+
+    new_interface = _remove_frozen_part(path)
+    old_interface = _remove_frozen_part(path, new_disks_interface=False)
+
+    assert "--recursive" in new_interface.call_args.kwargs["command_args"]
+    assert "--recursive" not in old_interface.call_args.kwargs["command_args"]
+
+
+def test_remove_frozen_parts_removes_every_part_on_its_own_disk():
+    """
+    A batch of deduplicated parts is removed in parallel, each through the
+    disk it is frozen on.
+    """
+    disk_manager, ch_ctl = _make_backup_disks(BACKUP_DISK_CLICKHOUSE_CONFIG)
+    ch_ctl.ch_version_ge.return_value = False
+    disks = {
+        name: Disk(name, f"/var/lib/clickhouse/disks/{name}/", "s3")
+        for name in ("object_storage", "object_storage_second")
+    }
+    parts = [
+        FrozenPart(
+            "db1",
+            "table1",
+            f"all_{i}_{i}_0",
+            name,
+            f"/var/lib/clickhouse/disks/{name}/shadow/20260101T000000/all_{i}_{i}_0",
+            "checksum",
+            1024,
+            [],
+        )
+        for i, name in enumerate(disks)
+    ]
+
+    with _capture_config_files():
+        with unittest.mock.patch("ch_backup.clickhouse.disks._exec") as exec_mock:
+            with unittest.mock.patch("shutil.rmtree"):
+                with disk_manager:
+                    disk_manager.remove_frozen_parts(disks, parts)
+
+    removed = {
+        call.kwargs["common_args"][-1]: call.kwargs["command_args"]
+        for call in exec_mock.call_args_list
+    }
+    assert removed == {
+        "object_storage": ["shadow/20260101T000000/all_0_0_0"],
+        "object_storage_second": ["shadow/20260101T000000/all_1_1_0"],
+    }
+
+
+def test_remove_frozen_parts_of_an_empty_batch_does_nothing():
+    """
+    Nothing was deduplicated, no processes are spawned.
+    """
+    disk_manager, _ = _make_backup_disks(BACKUP_DISK_CLICKHOUSE_CONFIG)
+
+    with _capture_config_files():
+        with unittest.mock.patch("ch_backup.clickhouse.disks._exec") as exec_mock:
+            with unittest.mock.patch("shutil.rmtree"):
+                with disk_manager:
+                    disk_manager.remove_frozen_parts({}, [])
+
+    exec_mock.assert_not_called()
+
+
+def test_remove_frozen_part_outside_shadow_raises():
+    """
+    Removal through the disk deletes the objects of a part that is not frozen.
+    """
+    with pytest.raises(ClickHouseDisksException):
+        _remove_frozen_part(
+            "/var/lib/clickhouse/disks/s3/store/abc/abcdef/all_1_1_0",
+        )
+
+
 def test_restore_requires_source_bucket_when_data_is_not_copied():
     """
     A backup that only references the source bucket cannot be restored without it.
@@ -825,3 +967,187 @@ def test_restore_and_backup_use_the_same_location():
             ]
 
     assert_equal(restore_endpoint, backup_endpoint)
+
+
+LINKED_BACKUP_NAME = "20251231T000000"
+
+
+def _make_linked_part(
+    name: str = "all_1_1_0", link_part_name: str | None = None
+) -> PartMetadata:
+    """Helper: build metadata of a deduplicated part on a cloud storage disk."""
+    return PartMetadata(
+        database="db1",
+        table="table1",
+        name=name,
+        checksum="checksum",
+        size=1024,
+        files=["checksums.txt"],
+        tarball=True,
+        link=LINKED_BACKUP_NAME,
+        link_part_name=link_part_name,
+        disk_name="object_storage",
+    )
+
+
+def test_restore_creates_a_disk_per_backup_holding_data():
+    """
+    Data of a deduplicated part is left in the backup it was copied into, so
+    it is read through a temporary disk of that backup.
+    """
+    disk_manager = _make_temporary_disks(
+        BACKUP_DISK_CLICKHOUSE_CONFIG,
+        cloud_storage_disks=["object_storage"],
+        data_copied=True,
+        source_bucket=None,
+        parts=[_make_linked_part()],
+    )
+
+    with _capture_config_files() as (written, _):
+        with disk_manager:
+            pass
+
+    config_path = (
+        "/etc/clickhouse-server/config.d/"
+        f"cloud_storage_tmp_disk_object_storage_source_{LINKED_BACKUP_NAME}.xml"
+    )
+    disks = xmltodict.parse(written[config_path], disable_entities=False)["clickhouse"][
+        "storage_configuration"
+    ]["disks"]
+    assert_equal(
+        disks[f"object_storage_source_{LINKED_BACKUP_NAME}"]["endpoint"],
+        f"https://minio:9000/backup-bucket/ch_backup/{LINKED_BACKUP_NAME}"
+        "/cloud_storage/object_storage/",
+    )
+
+
+def test_restore_downloads_metadata_of_the_backup_holding_data():
+    """
+    Metadata of a deduplicated part is stored in the backup its data was
+    copied into, together with the keys of the objects.
+    """
+    disk_manager = _make_temporary_disks(
+        BACKUP_DISK_CLICKHOUSE_CONFIG,
+        cloud_storage_disks=["object_storage"],
+        data_copied=True,
+        source_bucket=None,
+        parts=[_make_linked_part()],
+    )
+
+    with _capture_config_files():
+        with disk_manager:
+            pass
+
+    # pylint: disable=protected-access
+    download = disk_manager._backup_layout.download_cloud_storage_metadata
+    downloaded_backups = [call.args[0].name for call in download.call_args_list]
+    assert LINKED_BACKUP_NAME in downloaded_backups
+
+
+def test_restore_copies_a_deduplicated_part_from_its_own_backup():
+    """
+    A part is copied from the temporary disk of the backup holding its data.
+    """
+    part = _make_linked_part()
+    disk_manager = _make_temporary_disks(
+        BACKUP_DISK_CLICKHOUSE_CONFIG,
+        cloud_storage_disks=["object_storage"],
+        data_copied=True,
+        source_bucket=None,
+        parts=[part],
+    )
+    target_disk = Disk(
+        "object_storage", "/var/lib/clickhouse/disks/object_storage/", "s3"
+    )
+    source_disk_name = f"object_storage_source_{LINKED_BACKUP_NAME}"
+    # pylint: disable=protected-access
+    disk_manager._ch_availible_disks = {
+        "object_storage": target_disk,
+        source_disk_name: Disk(source_disk_name, BACKUP_DISK_PATH, "s3"),
+    }
+    table = Table(
+        "db1",
+        "table1",
+        "MergeTree",
+        [target_disk],
+        [os.path.join(target_disk.path, "store/abc/abcdef")],
+        "",
+        "",
+        None,
+    )
+
+    with unittest.mock.patch(
+        "ch_backup.clickhouse.disks._ch_disks_copy"
+    ) as copy_command:
+        disk_manager._run_copy_command(disk_manager._backup_meta, table, part)
+
+    _, from_disk, from_path, _, _, _ = copy_command.call_args.args
+    assert_equal(from_disk, source_disk_name)
+    assert_equal(from_path, f"shadow/{LINKED_BACKUP_NAME}/store/abc/abcdef/all_1_1_0/")
+
+
+def test_restore_copies_a_renamed_part_under_its_stored_name():
+    """
+    A mutation renames a part, and its data is stored under the name it had in
+    the backup it was copied into.
+    """
+    part = _make_linked_part(name="all_1_1_0_2", link_part_name="all_1_1_0")
+    disk_manager = _make_temporary_disks(
+        BACKUP_DISK_CLICKHOUSE_CONFIG,
+        cloud_storage_disks=["object_storage"],
+        data_copied=True,
+        source_bucket=None,
+        parts=[part],
+    )
+    target_disk = Disk(
+        "object_storage", "/var/lib/clickhouse/disks/object_storage/", "s3"
+    )
+    source_disk_name = f"object_storage_source_{LINKED_BACKUP_NAME}"
+    # pylint: disable=protected-access
+    disk_manager._ch_availible_disks = {
+        "object_storage": target_disk,
+        source_disk_name: Disk(source_disk_name, BACKUP_DISK_PATH, "s3"),
+    }
+    table = Table(
+        "db1",
+        "table1",
+        "MergeTree",
+        [target_disk],
+        [os.path.join(target_disk.path, "store/abc/abcdef")],
+        "",
+        "",
+        None,
+    )
+
+    with unittest.mock.patch(
+        "ch_backup.clickhouse.disks._ch_disks_copy"
+    ) as copy_command:
+        disk_manager._run_copy_command(disk_manager._backup_meta, table, part)
+
+    _, _, from_path, _, _, _ = copy_command.call_args.args
+    assert_equal(from_path, f"shadow/{LINKED_BACKUP_NAME}/store/abc/abcdef/all_1_1_0/")
+
+
+def test_restore_fails_when_the_backup_holding_data_is_gone():
+    """
+    A missing backup must be reported instead of silently restoring a table
+    without parts of it.
+    """
+    disk_manager = _make_temporary_disks(
+        BACKUP_DISK_CLICKHOUSE_CONFIG,
+        cloud_storage_disks=["object_storage"],
+        data_copied=True,
+        source_bucket=None,
+        parts=[_make_linked_part()],
+    )
+    # pylint: disable=protected-access
+    disk_manager._backup_layout.get_backup.side_effect = None
+    disk_manager._backup_layout.get_backup.return_value = None
+
+    with _capture_config_files():
+        try:
+            with disk_manager:
+                pass
+            assert False, "Expected ClickHouseDisksException was not raised"
+        except ClickHouseDisksException as exc:
+            assert LINKED_BACKUP_NAME in str(exc)
