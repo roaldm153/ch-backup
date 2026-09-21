@@ -106,6 +106,12 @@ test-integration: create-test-env
 	uv run behave --show-timings --stop -D skip_setup $(BEHAVE_ARGS) @tests/integration/ch_backup.featureset
 
 
+.PHONY: test-integration-large-objects
+test-integration-large-objects: create-test-env
+	rm -rf staging/logs
+	uv run behave --show-timings --stop -D skip_setup $(BEHAVE_ARGS) @tests/integration/large_objects.featureset
+
+
 .PHONY: clean
 clean: clean-test-env clean-pycache clean-debuild
 	rm -rf ${VENV} *.egg-info htmlcov .coverage* .hypothesis .mypy_cache .pytest_cache \
@@ -220,6 +226,7 @@ help:
 	@echo "  lint                       Run all linter tools. Alias for \"isort black codespell ruff pylint mypy\"."
 	@echo "  test-unit                  Run unit tests."
 	@echo "  test-integration           Run integration tests."
+	@echo "  test-integration-large-objects  Run the copy of objects of several parts alone."
 	@echo "  isort                      Perform isort checks."
 	@echo "  black                      Perform black checks."
 	@echo "  codespell                  Perform codespell checks."

@@ -76,6 +76,18 @@ class S3Client:
         except ClientError:
             return False
 
+    def list_objects_metadata(self, prefix: str) -> list[dict]:
+        """
+        List all objects with given prefix along with their size and ETag.
+        """
+        contents: list[dict] = []
+        paginator = self._s3_client.get_paginator("list_objects")
+
+        for result in paginator.paginate(Bucket=self._s3_bucket_name, Prefix=prefix):
+            contents.extend(result.get("Contents") or [])
+
+        return contents
+
     def list_objects(self, prefix: str) -> list[str]:
         """
         List all objects with given prefix.
