@@ -35,14 +35,17 @@ from ch_backup.encryption import get_encryption
 from ch_backup.exceptions import StorageError
 from ch_backup.storage import StorageLoader
 from ch_backup.storage.engine.s3 import S3RetryingError
-from ch_backup.util import dir_is_empty, escape_metadata_file_name
+from ch_backup.util import (
+    CLOUD_STORAGE_EXCLUDE_FILE_NAMES,
+    dir_is_empty,
+    escape_metadata_file_name,
+)
 
 BACKUP_META_FNAME = "backup_struct.json"
 BACKUP_LIGHT_META_FNAME = "backup_light_struct.json"
 ACCESS_CONTROL_FNAME = "access_control.tar"
 DATABASES_FNAME = "databases.tar"
 COMPRESSED_EXTENSION = ".gz"
-CLOUD_STORAGE_EXCLUDE_FILE_NAMES = ["frozen_metadata.txt"]
 CLOUD_STORAGE_METADATA_DIR = "disks"
 CLOUD_STORAGE_DATA_DIR = "cloud_storage"
 

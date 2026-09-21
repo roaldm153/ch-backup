@@ -28,6 +28,7 @@ from ch_backup.clickhouse.models import (
 from ch_backup.exceptions import ClickhouseBackupError, ConfigurationError
 from ch_backup.storage.async_pipeline.base_pipeline.exec_pool import ThreadExecPool
 from ch_backup.util import (
+    CLOUD_STORAGE_EXCLUDE_FILE_NAMES,
     chown_dir_contents,
     chown_file,
     escape,
@@ -1604,10 +1605,13 @@ def _get_cloud_part_checksum(part_path: str, rel_paths: Sequence[str]) -> str:
 
     Files of such a part are metadata referring to objects with random keys.
     ClickHouse rewrites the metadata on every freeze, so the keys are what
-    identifies the data of the part.
+    identifies the data of the part. Freezing a replicated table also leaves a
+    file describing the replica, which refers to no object at all.
     """
     checksum = md5()  # nosec
     for rel_path in sorted(rel_paths):
+        if rel_path in CLOUD_STORAGE_EXCLUDE_FILE_NAMES:
+            continue
         checksum.update(rel_path.encode())
         for object_key in _read_object_keys(os.path.join(part_path, rel_path)):
             checksum.update(object_key.encode())

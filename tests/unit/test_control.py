@@ -97,6 +97,21 @@ def test_cloud_part_checksum_of_an_empty_file(tmp_path):
     assert checksum
 
 
+def test_cloud_part_checksum_ignores_the_metadata_of_a_freeze(tmp_path):
+    """
+    Freezing a replicated table leaves a file naming the replica, which is not
+    disk metadata and has no object keys in it.
+    """
+    path = tmp_path / "part"
+    checksum = _make_cloud_part(path, {"checksums.txt": ["abc/defg"]})
+    (path / "frozen_metadata.txt").write_text("1\nclickhouse01\n", encoding="utf-8")
+
+    assert (
+        _get_cloud_part_checksum(str(path), ["checksums.txt", "frozen_metadata.txt"])
+        == checksum
+    )
+
+
 def test_cloud_part_checksum_fails_on_unknown_metadata_format(tmp_path):
     path = tmp_path / "part"
     path.mkdir()
