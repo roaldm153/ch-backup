@@ -70,10 +70,10 @@ class TableBackup(BackupManager):
 
         backup_name = context.backup_meta.get_sanitized_name()
 
-        if context.cloud_conf.get("cloud_storage", {}).get("encryption", True):
+        if context.cloud_conf.get("encryption", True):
             logging.debug('Cloud Storage "shadow" backup will be encrypted')
             context.backup_meta.cloud_storage.encrypt()
-        if context.cloud_conf.get("cloud_storage", {}).get("compression", True):
+        if context.cloud_conf.get("compression", True):
             logging.debug('Cloud Storage "shadow" backup will be compressed')
             context.backup_meta.cloud_storage.compress()
 
