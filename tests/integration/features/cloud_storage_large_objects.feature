@@ -57,3 +57,58 @@ Feature: Copy of cloud storage objects that do not fit into a single CopyObject
     # as well. Every instance has a bucket of its own, and this is the one of
     # the instance restored to.
     And s3 bucket cloud-storage-02 contains an object of several parts with prefix "data_multipart/"
+
+  @object_storage_large_copy
+  @require_version_24.1
+  Scenario: Restore of a deduplicated backup of objects copied in several parts
+    Given ch-backup configuration on clickhouse01
+    """
+    multiprocessing:
+        cloud_storage_backup_workers: 4
+    """
+    And we have executed queries on clickhouse01
+    """
+    CREATE DATABASE IF NOT EXISTS test_db;
+
+    CREATE TABLE test_db.table_01 (UserID UInt32, Payload String)
+    ENGINE = MergeTree() ORDER BY UserID
+    SETTINGS storage_policy = 's3_multipart', min_bytes_for_wide_part = 1000000000;
+    CREATE TABLE test_db.table_02 (UserID UInt32, Payload String)
+    ENGINE = MergeTree() ORDER BY UserID
+    SETTINGS storage_policy = 's3_multipart', min_bytes_for_wide_part = 1000000000;
+    CREATE TABLE test_db.table_03 (UserID UInt32, Payload String)
+    ENGINE = MergeTree() ORDER BY UserID
+    SETTINGS storage_policy = 's3_multipart', min_bytes_for_wide_part = 1000000000;
+
+    INSERT INTO test_db.table_01 SELECT number, randomPrintableASCII(1024) FROM system.numbers LIMIT 12000;
+    INSERT INTO test_db.table_02 SELECT number, randomPrintableASCII(1024) FROM system.numbers LIMIT 12000;
+    INSERT INTO test_db.table_03 SELECT number, randomPrintableASCII(1024) FROM system.numbers LIMIT 12000;
+    """
+    Then s3 bucket cloud-storage-01 contains an object larger than 5242880 bytes with prefix "data_multipart/"
+    When we create clickhouse01 clickhouse backup
+    """
+    name: test_backup1
+    copy_cloud_storage_data: true
+    """
+    Then s3 bucket ch-backup contains an object of several parts with prefix "ch_backup/test_backup1/cloud_storage/s3_multipart/"
+    When we save all user's data in context on clickhouse01
+    And we save data part checksums in context on clickhouse01
+    And we create clickhouse01 clickhouse backup
+    """
+    name: test_backup2
+    copy_cloud_storage_data: true
+    """
+    # The tables have not changed, so the second backup copies nothing and
+    # keeps a link to the data of the first one instead.
+    Then we got the following backups on clickhouse01
+      | num | state   | data_count | link_count |
+      | 0   | created | 0          | 3          |
+      | 1   | created | 3          | 0          |
+    And s3 bucket ch-backup contains no objects with prefix "ch_backup/test_backup2/cloud_storage/"
+    When we delete all objects in s3 bucket cloud-storage-01
+    # Restore of the second backup has to resolve the links and copy the data
+    # out of the first one, which is the only place holding it now.
+    And we restore clickhouse backup "test_backup2" to clickhouse02
+    Then the user's data equal to saved one on clickhouse02
+    And data part checksums equal to saved ones on clickhouse02
+    And s3 bucket cloud-storage-02 contains an object of several parts with prefix "data_multipart/"
