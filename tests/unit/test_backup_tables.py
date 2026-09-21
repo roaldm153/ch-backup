@@ -457,7 +457,7 @@ class TestCloudStorageCopyDataFlag:
         [({"copy_data": True}, True), ({"copy_data": False}, False), ({}, False)],
         ids=["enabled", "disabled", "absent"],
     )
-    def test_flag_follows_the_option(self, cloud_conf, data_copied) -> None:
+    def test_flag_follows_the_option(self, cloud_conf: dict, data_copied: bool) -> None:
         """
         The option marks the backup as containing copied cloud storage data.
         Disabled or absent, it keeps the default of storing references only.
@@ -643,12 +643,12 @@ class TestCloudStorageCopyPool:
         tables = cls._make_tables(table_count)
 
         context = _make_backup_context({"copy_data": True})
-        if ch_ctl is not None:
-            context.ch_ctl = ch_ctl
-        context.ch_ctl.get_tables.return_value = tables
-        context.ch_ctl.get_disks.return_value = {}
-        context.ch_ctl.scan_frozen_parts.return_value = []
-        context.backup_layout.has_frozen_cloud_storage_data.return_value = True
+        ch_ctl = MagicMock() if ch_ctl is None else ch_ctl
+        context.ch_ctl = ch_ctl
+        ch_ctl.get_tables.return_value = tables
+        ch_ctl.get_disks.return_value = {}
+        ch_ctl.scan_frozen_parts.return_value = []
+        context.backup_layout.has_frozen_cloud_storage_data.return_value = True  # type: ignore[attr-defined]
 
         change_time = Mock(
             side_effect=lambda path: TableMetadataChangeTime(
@@ -666,7 +666,7 @@ class TestCloudStorageCopyPool:
                 [DATABASE],
                 {"db1": [table.name for table in tables]},
                 schema_only=False,
-                multiprocessing_config=DEFAULT_CONFIG["multiprocessing"],
+                multiprocessing_config=DEFAULT_CONFIG["multiprocessing"],  # type: ignore[arg-type]
             )
 
         return context
@@ -681,7 +681,8 @@ class TestCloudStorageCopyPool:
         context = self._run_backup(backup_disks, table_count=3)
 
         assert backup_disks.copy_table_data.call_count == 3
-        assert context.backup_layout.upload_cloud_storage_metadata.call_count == 3
+        upload = context.backup_layout.upload_cloud_storage_metadata
+        assert upload.call_count == 3  # type: ignore[attr-defined]
         assert context.backup_meta.cloud_storage.disks == ["s3"]
 
     def test_copies_of_different_tables_run_in_parallel(self):
@@ -709,7 +710,7 @@ class TestCloudStorageCopyPool:
         calls: list[str] = []
         backup_disks = MagicMock()
         backup_disks.copy_table_data.side_effect = lambda *_: (
-            calls.append("copy"),
+            calls.append("copy"),  # type: ignore[func-returns-value]
             self._BACKUP_DISK,
         )[1]
         ch_ctl = Mock()
@@ -807,7 +808,7 @@ class TestCloudStorageDeduplication:
 
         Returns the backup disks and the deduplication call.
         """
-        context.ch_ctl.scan_frozen_parts.side_effect = lambda _table, disk, *_: [
+        context.ch_ctl.scan_frozen_parts.side_effect = lambda _table, disk, *_: [  # type: ignore[attr-defined]
             part for part in frozen_parts if part.disk_name == disk.name
         ]
         backup_disks = Mock() if context.backup_meta.cloud_storage.data_copied else None
@@ -832,7 +833,7 @@ class TestCloudStorageDeduplication:
             {"all_1_1_0": self._make_deduplicated_part("all_1_1_0", "s3")},
         )
 
-        disks, removed = backup_disks.remove_frozen_parts.call_args.args
+        disks, removed = backup_disks.remove_frozen_parts.call_args.args  # type: ignore[union-attr]
         assert removed == [frozen_part]
         assert disks[frozen_part.disk_name] is self._DISK
         part = next(iter(context.backup_meta.get_tables("db1")[0].get_parts()))
@@ -849,7 +850,7 @@ class TestCloudStorageDeduplication:
             context, [self._make_frozen_part("all_1_1_0", self._DISK)], {}
         )
 
-        assert not backup_disks.remove_frozen_parts.call_args.args[1]
+        assert not backup_disks.remove_frozen_parts.call_args.args[1]  # type: ignore[union-attr]
         part = next(iter(context.backup_meta.get_tables("db1")[0].get_parts()))
         assert part.link is None
         assert context.backup_meta.cloud_storage.disks == ["s3"]
@@ -868,7 +869,7 @@ class TestCloudStorageDeduplication:
             {"all_1_1_0": self._make_deduplicated_part("all_1_1_0", "s3_second")},
         )
 
-        assert not backup_disks.remove_frozen_parts.call_args.args[1]
+        assert not backup_disks.remove_frozen_parts.call_args.args[1]  # type: ignore[union-attr]
         part = next(iter(context.backup_meta.get_tables("db1")[0].get_parts()))
         assert part.link is None
 

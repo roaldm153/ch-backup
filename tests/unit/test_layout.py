@@ -13,7 +13,7 @@ from ch_backup.config import DEFAULT_CONFIG
 
 def make_layout() -> BackupLayout:
     """Helper: build a BackupLayout with a mocked storage loader."""
-    config = copy.deepcopy(DEFAULT_CONFIG)
+    config: dict = copy.deepcopy(DEFAULT_CONFIG)
     config["backup"]["path_root"] = "ch_backup"
     with (
         patch("ch_backup.backup.layout.StorageLoader"),
@@ -48,8 +48,8 @@ class TestCloudStorageMetadataRemotePaths:
             f"{backup_path}/disks/{source_disk_name}/db2/table3.tar",
         ]
 
-        layout._storage_loader.path_exists.side_effect = {old_style_path: False}.get
-        layout._storage_loader.list_dir.side_effect = lambda _disk_path, **_kwargs: [
+        layout._storage_loader.path_exists.side_effect = {old_style_path: False}.get  # type: ignore[attr-defined]
+        layout._storage_loader.list_dir.side_effect = lambda _disk_path, **_kwargs: [  # type: ignore[attr-defined]
             *expected_paths,
             f"{backup_path}/disks/{source_disk_name}/db2/table4.tar",
         ]
@@ -77,7 +77,7 @@ class TestCloudStorageMetadataUpload:
     def _make_layout() -> tuple[BackupLayout, MagicMock]:
         """Helper: build a BackupLayout and expose its storage loader."""
         layout = make_layout()
-        return layout, layout._storage_loader
+        return layout, layout._storage_loader  # type: ignore[return-value]
 
     def _make_backup_meta(self) -> MagicMock:
         backup_meta = MagicMock()
@@ -168,9 +168,8 @@ class TestCloudStorageMetadataLookup:
     @staticmethod
     def _probed_paths(layout: BackupLayout) -> list:
         """Helper: return paths the lookup checked for existence."""
-        return [
-            call.args[0] for call in layout._storage_loader.path_exists.call_args_list
-        ]
+        path_exists = layout._storage_loader.path_exists
+        return [call.args[0] for call in path_exists.call_args_list]  # type: ignore[attr-defined]
 
     def test_dashed_backup_name_is_looked_up_under_the_sanitized_path(self):
         """
@@ -178,7 +177,7 @@ class TestCloudStorageMetadataLookup:
         up by the raw name would never find it and deduplication would be lost.
         """
         layout = make_layout()
-        layout._storage_loader.path_exists.return_value = False
+        layout._storage_loader.path_exists.return_value = False  # type: ignore[attr-defined]
 
         layout.has_cloud_storage_metadata("my-backup", "db1", "table1", "s3")
 
@@ -192,7 +191,7 @@ class TestCloudStorageMetadataLookup:
         Either extension means the metadata is there.
         """
         layout = make_layout()
-        layout._storage_loader.path_exists.side_effect = {
+        layout._storage_loader.path_exists.side_effect = {  # type: ignore[attr-defined]
             "ch_backup/my_backup/disks/s3/db1/table1.tar": True
         }.get
 
@@ -203,7 +202,7 @@ class TestCloudStorageMetadataLookup:
         A backup without the metadata of the table cannot be linked to.
         """
         layout = make_layout()
-        layout._storage_loader.path_exists.return_value = False
+        layout._storage_loader.path_exists.return_value = False  # type: ignore[attr-defined]
 
         assert not layout.has_cloud_storage_metadata("my-backup", "db1", "table1", "s3")
 
@@ -217,7 +216,7 @@ class TestCloudStorageDataDeletion:
     def _make_layout() -> tuple[BackupLayout, MagicMock]:
         """Helper: build a BackupLayout that records paths passed for deletion."""
         layout = make_layout()
-        layout._storage_loader.list_dir.side_effect = lambda path, **_kwargs: [
+        layout._storage_loader.list_dir.side_effect = lambda path, **_kwargs: [  # type: ignore[attr-defined]
             f"{path}/object"
         ]
         delete_files = MagicMock()
@@ -245,7 +244,7 @@ class TestCloudStorageDataDeletion:
         whole would delete metadata and data parts of the other backup.
         """
         layout = make_layout()
-        layout._storage_loader.list_dir.side_effect = lambda path, **_kwargs: {
+        layout._storage_loader.list_dir.side_effect = lambda path, **_kwargs: {  # type: ignore[attr-defined]
             "ch_backup/my-backup": ["ch_backup/my-backup/backup_struct.json"],
             "ch_backup/my_backup": [
                 "ch_backup/my_backup/backup_struct.json",
@@ -253,7 +252,9 @@ class TestCloudStorageDataDeletion:
                 "ch_backup/my_backup/disks/s3/db/table.tar",
             ],
             "ch_backup/my_backup/disks": ["ch_backup/my_backup/disks/s3/db/table.tar"],
-        }.get(path, [])
+        }.get(
+            path, []
+        )
         delete_files = MagicMock()
         setattr(layout, "_delete_files", delete_files)
 

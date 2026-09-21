@@ -287,10 +287,10 @@ def _make_temporary_disks(
     context.backup_layout.get_backup.side_effect = lambda name, **_: (
         _make_linked_backup_meta(name)
     )
-    context.backup_meta.cloud_storage.disks = cloud_storage_disks or []
-    context.backup_meta.cloud_storage.enabled = bool(cloud_storage_disks)
-    context.backup_meta.cloud_storage.data_copied = data_copied
-    context.backup_meta.cloud_storage.requires_source_bucket = (
+    context.backup_meta.cloud_storage.disks = cloud_storage_disks or []  # type: ignore[misc]
+    context.backup_meta.cloud_storage.enabled = bool(cloud_storage_disks)  # type: ignore[misc]
+    context.backup_meta.cloud_storage.data_copied = data_copied  # type: ignore[misc]
+    context.backup_meta.cloud_storage.requires_source_bucket = (  # type: ignore[misc]
         bool(cloud_storage_disks) and not data_copied
     )
 
@@ -298,8 +298,8 @@ def _make_temporary_disks(
     table.database = "db1"
     table.name = "table1"
     table.get_parts.return_value = list(parts)
-    context.backup_meta.get_databases.return_value = ["db1"]
-    context.backup_meta.get_tables.return_value = [table]
+    context.backup_meta.get_databases.return_value = ["db1"]  # type: ignore[attr-defined]
+    context.backup_meta.get_tables.return_value = [table]  # type: ignore[attr-defined]
 
     return ClickHouseTemporaryDisks(
         context.ch_ctl,
@@ -410,7 +410,7 @@ def _make_backup_disks(
     config = _make_backup_storage_config()
     config["storage"].update(storage_config or {})
     context = _make_context(config, clickhouse_config_xml)
-    context.ch_ctl.get_disk.return_value = Disk(
+    context.ch_ctl.get_disk.return_value = Disk(  # type: ignore[attr-defined]
         "object_storage_backup", BACKUP_DISK_PATH, "s3"
     )
     disks = ClickHouseBackupDisks(
@@ -420,7 +420,7 @@ def _make_backup_disks(
         context.backup_meta,
         context.ch_config,
     )
-    return disks, context.ch_ctl
+    return disks, context.ch_ctl  # type: ignore[return-value]
 
 
 @contextmanager
@@ -1015,7 +1015,7 @@ def test_restore_downloads_metadata_of_the_backup_holding_data():
 
     # pylint: disable=protected-access
     download = disk_manager._backup_layout.download_cloud_storage_metadata
-    downloaded_backups = [call.args[0].name for call in download.call_args_list]
+    downloaded_backups = [call.args[0].name for call in download.call_args_list]  # type: ignore[attr-defined]
     assert LINKED_BACKUP_NAME in downloaded_backups
 
 
@@ -1083,8 +1083,8 @@ def test_restore_fails_when_the_backup_holding_data_is_gone():
         parts=[_make_linked_part()],
     )
     # pylint: disable=protected-access
-    disk_manager._backup_layout.get_backup.side_effect = None
-    disk_manager._backup_layout.get_backup.return_value = None
+    disk_manager._backup_layout.get_backup.side_effect = None  # type: ignore[attr-defined]
+    disk_manager._backup_layout.get_backup.return_value = None  # type: ignore[attr-defined]
 
     with _capture_config_files():
         try:
