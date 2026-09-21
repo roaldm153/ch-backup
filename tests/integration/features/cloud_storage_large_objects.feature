@@ -130,23 +130,19 @@ Feature: Copy of cloud storage objects that do not fit into a single CopyObject
     CREATE DATABASE IF NOT EXISTS test_db;
 
     CREATE TABLE test_db.table_01 (UserID UInt64, Payload String)
-    ENGINE = MergeTree() ORDER BY UserID SETTINGS storage_policy = 's3_load';
+    ENGINE = MergeTree() ORDER BY UserID
+    SETTINGS storage_policy = 's3_load', max_bytes_to_merge_at_max_space_in_pool = 1;
     CREATE TABLE test_db.table_02 (UserID UInt64, Payload String)
-    ENGINE = MergeTree() ORDER BY UserID SETTINGS storage_policy = 's3_load';
+    ENGINE = MergeTree() ORDER BY UserID
+    SETTINGS storage_policy = 's3_load', max_bytes_to_merge_at_max_space_in_pool = 1;
     CREATE TABLE test_db.table_03 (UserID UInt64, Payload String)
-    ENGINE = MergeTree() ORDER BY UserID SETTINGS storage_policy = 's3_load';
-
-    SYSTEM STOP MERGES test_db.table_01;
-    SYSTEM STOP MERGES test_db.table_02;
-    SYSTEM STOP MERGES test_db.table_03;
+    ENGINE = MergeTree() ORDER BY UserID
+    SETTINGS storage_policy = 's3_load', max_bytes_to_merge_at_max_space_in_pool = 1;
     """
-    # Data of this size lands in tens of parts, and merging them would give the
-    # restored table parts of its own, with checksums of their own. The one
-    # restored to is stopped whole: its tables do not exist yet.
-    And we have executed queries on clickhouse02
-    """
-    SYSTEM STOP MERGES;
-    """
+    # Data of this size lands in tens of parts, and merging them would leave the
+    # restored table with parts of its own and checksums of their own. Merges
+    # are held off by the schema rather than by SYSTEM STOP MERGES: the schema
+    # is what the restore brings to the other instance.
     When we insert 4 GiB of incompressible data into test_db.table_01 on clickhouse01
     And we insert 4 GiB of incompressible data into test_db.table_02 on clickhouse01
     And we insert 4 GiB of incompressible data into test_db.table_03 on clickhouse01
