@@ -23,7 +23,7 @@ from ch_backup.backup_context import BackupContext
 from ch_backup.clickhouse.client import ClickhouseError
 from ch_backup.clickhouse.disks import ClickHouseBackupDisks, ClickHouseTemporaryDisks
 from ch_backup.clickhouse.metadata_cleaner import MetadataCleaner
-from ch_backup.clickhouse.models import Database, FrozenPart, Table
+from ch_backup.clickhouse.models import Database, Disk, FrozenPart, Table
 from ch_backup.clickhouse.schema import (
     rewrite_table_schema,
     to_attach_query,
@@ -100,6 +100,15 @@ class TableBackup(BackupManager):
         with ExitStack() as stack:
             backup_disks = None
             if context.backup_meta.cloud_storage.data_copied:
+                copy_workers = multiprocessing_config.get(
+                    "cloud_storage_backup_workers", 1
+                )
+                if copy_workers > 1 and not context.ch_ctl.ch_version_ge("23.3"):
+                    logging.warning(
+                        "It is unsafe to use cloud_storage_backup_workers > 1 with clickhouse version < 23.3"
+                        f" (cloud_storage_backup_workers: {copy_workers}, ch_version: {context.ch_ctl.get_version()})"
+                    )
+
                 backup_disks = stack.enter_context(
                     ClickHouseBackupDisks(
                         context.ch_ctl,
@@ -179,9 +188,14 @@ class TableBackup(BackupManager):
             # race condition with parallel freeze
             context.ch_ctl.create_shadow_increment()
             try:
-                with ThreadExecPool(
-                    multiprocessing_config.get("freeze_threads", 1)
-                ) as pool:
+                with (
+                    ThreadExecPool(
+                        multiprocessing_config.get("cloud_storage_backup_workers", 1)
+                    ) as copy_pool,
+                    ThreadExecPool(
+                        multiprocessing_config.get("freeze_threads", 1)
+                    ) as pool,
+                ):
                     for table in tables_:
                         pool.submit(
                             f'Freeze table "{table.database}"."{table.name}"',
@@ -227,8 +241,10 @@ class TableBackup(BackupManager):
                                         backup_name,
                                     )
                                     self._backup_cloud_storage_metadata(
-                                        context, freezed_table, backup_disks
+                                        context, copy_pool, freezed_table, backup_disks
                                     )
+
+                    self._upload_cloud_storage_metadata(context, copy_pool)
             finally:
                 if create_statements_to_backup:
                     context.backup_layout.upload_create_statements(
@@ -324,16 +340,15 @@ class TableBackup(BackupManager):
     @staticmethod
     def _backup_cloud_storage_metadata(
         context: BackupContext,
+        pool: ThreadExecPool,
         table: Table,
         backup_disks: ClickHouseBackupDisks | None = None,
     ) -> None:
         """
-        Backup cloud storage metadata files.
+        Schedule backup of cloud storage metadata files of a table.
 
-        When backup_disks is set, disk data is copied into the backup and
-        metadata of the copies is uploaded instead of the frozen one. The copy
-        is checked explicitly, since clickhouse-disks reports its errors with
-        a zero exit code.
+        Data of every disk is copied on its own, so that copies of different
+        tables and disks go in parallel.
         """
         logging.debug(
             'Backing up Cloud Storage disks "shadow" directory of "{}"."{}"',
@@ -350,17 +365,53 @@ class TableBackup(BackupManager):
                 logging.debug(f'No data frozen on disk "{disk.name}", skipping')
                 continue
 
-            source_disk = (
-                backup_disks.copy_table_data(disk.name, table) if backup_disks else None
+            pool.submit(
+                f'Backup of disk "{disk.name}" of "{table.database}"."{table.name}"',
+                TableBackup._copy_cloud_storage_data,
+                context,
+                table,
+                disk,
+                backup_disks,
             )
-            if source_disk and not context.backup_layout.has_frozen_cloud_storage_data(
-                context.backup_meta, source_disk, table
-            ):
-                raise ClickhouseBackupError(
-                    f'Copying data of disk "{disk.name}" of table '
-                    f"`{table.database}`.`{table.name}` produced no metadata"
-                )
 
+    @staticmethod
+    def _copy_cloud_storage_data(
+        context: BackupContext,
+        table: Table,
+        disk: Disk,
+        backup_disks: ClickHouseBackupDisks | None,
+    ) -> tuple[Table, Disk, Disk | None]:
+        """
+        Copy data of a table on a cloud storage disk into the backup.
+
+        The result is checked explicitly, since clickhouse-disks reports its
+        errors with a zero exit code.
+        """
+        if not backup_disks:
+            return table, disk, None
+
+        source_disk = backup_disks.copy_table_data(disk.name, table)
+        if not context.backup_layout.has_frozen_cloud_storage_data(
+            context.backup_meta, source_disk, table
+        ):
+            raise ClickhouseBackupError(
+                f'Copying data of disk "{disk.name}" of table '
+                f"`{table.database}`.`{table.name}` produced no metadata"
+            )
+
+        return table, disk, source_disk
+
+    @staticmethod
+    def _upload_cloud_storage_metadata(
+        context: BackupContext, pool: ThreadExecPool
+    ) -> None:
+        """
+        Upload cloud storage metadata files of tables as their data is copied.
+
+        Uploading stays in the calling thread: both the upload pipeline and the
+        backup metadata are not meant to be used from several threads.
+        """
+        for table, disk, source_disk in pool.as_completed(keep_going=False):
             context.backup_layout.upload_cloud_storage_metadata(
                 context.backup_meta, disk, table, source_disk=source_disk
             )
