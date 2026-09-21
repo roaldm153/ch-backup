@@ -109,7 +109,19 @@ test-integration: create-test-env
 .PHONY: test-integration-large-objects
 test-integration-large-objects: create-test-env
 	rm -rf staging/logs
-	uv run behave --show-timings --stop -D skip_setup $(BEHAVE_ARGS) @tests/integration/large_objects.featureset
+	uv run behave --show-timings --stop -D skip_setup --tags=object_storage_large_copy $(BEHAVE_ARGS) @tests/integration/large_objects.featureset
+
+
+# Size of a single table, three of them are filled. A copy of that much data
+# outlives the default timeout of a docker API call, hence DOCKER_TIMEOUT.
+LOAD_TABLE_GB ?= 4
+
+.PHONY: test-integration-object-storage-load
+test-integration-object-storage-load: create-test-env
+	rm -rf staging/logs
+	DOCKER_TIMEOUT=7200 uv run behave --show-timings --stop -D skip_setup \
+	    -D load_table_gb=$(LOAD_TABLE_GB) --tags=object_storage_load \
+	    $(BEHAVE_ARGS) @tests/integration/large_objects.featureset
 
 
 .PHONY: clean
@@ -227,6 +239,7 @@ help:
 	@echo "  test-unit                  Run unit tests."
 	@echo "  test-integration           Run integration tests."
 	@echo "  test-integration-large-objects  Run the copy of objects of several parts alone."
+	@echo "  test-integration-object-storage-load  Run the same on tens of gigabytes."
 	@echo "  isort                      Perform isort checks."
 	@echo "  black                      Perform black checks."
 	@echo "  codespell                  Perform codespell checks."

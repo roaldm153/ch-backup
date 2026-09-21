@@ -7,13 +7,15 @@ parts, which is how a multipart copy is told from a single CopyObject.
 
 import re
 
-from behave import then
+from behave import then, when
 from hamcrest import assert_that, equal_to, greater_than
 
 from tests.integration.modules import s3
+from tests.integration.modules.docker import get_container
 from tests.integration.modules.typing import ContextT
 
 MULTIPART_ETAG = re.compile(r'"?\w+-\d+"?')
+ROW_SIZE = 1024
 
 
 def _multipart_objects(context: ContextT, bucket: str, prefix: str) -> list[str]:
@@ -26,6 +28,27 @@ def _multipart_objects(context: ContextT, bucket: str, prefix: str) -> list[str]
         for obj in s3_client.list_objects_metadata(prefix)
         if MULTIPART_ETAG.fullmatch(obj["ETag"])
     ]
+
+
+@when("we insert {size:d} GiB of incompressible data into {table} on {node:w}")
+def step_insert_incompressible_data(context, size, table, node):
+    """
+    Fill a table with random data, which S3 stores as given.
+
+    The size of a single table is overridden with -D load_table_gb=<size>.
+    The query is run inside the container: it takes longer than the timeout of
+    the HTTP client used by the rest of the steps.
+    """
+    size = int(context.config.userdata.get("load_table_gb", size))
+    rows = size * 1024**3 // ROW_SIZE
+    query = (
+        f"INSERT INTO {table} "
+        f"SELECT number, randomPrintableASCII({ROW_SIZE}) "
+        f"FROM system.numbers_mt LIMIT {rows} SETTINGS max_insert_threads = 4"
+    )
+
+    result = get_container(context, node).exec_run(["clickhouse-client", "-q", query])
+    assert result.exit_code == 0, result.output.decode()
 
 
 @then(

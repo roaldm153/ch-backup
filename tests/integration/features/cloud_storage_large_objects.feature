@@ -112,3 +112,56 @@ Feature: Copy of cloud storage objects that do not fit into a single CopyObject
     Then the user's data equal to saved one on clickhouse02
     And data part checksums equal to saved ones on clickhouse02
     And s3 bucket cloud-storage-02 contains an object of several parts with prefix "data_multipart/"
+
+  # The disk of the 's3_load' policy is left with the settings ClickHouse comes
+  # with, so the data is copied the way it would be on an installation. Tens of
+  # gigabytes take tens of minutes and a few times their size in disk space,
+  # which is why this one is run on its own.
+  @object_storage_load
+  @require_version_24.1
+  Scenario: Backup and restore of tables of several gigabytes
+    Given ch-backup configuration on clickhouse01
+    """
+    multiprocessing:
+        cloud_storage_backup_workers: 4
+    """
+    And we have executed queries on clickhouse01
+    """
+    CREATE DATABASE IF NOT EXISTS test_db;
+
+    CREATE TABLE test_db.table_01 (UserID UInt64, Payload String)
+    ENGINE = MergeTree() ORDER BY UserID SETTINGS storage_policy = 's3_load';
+    CREATE TABLE test_db.table_02 (UserID UInt64, Payload String)
+    ENGINE = MergeTree() ORDER BY UserID SETTINGS storage_policy = 's3_load';
+    CREATE TABLE test_db.table_03 (UserID UInt64, Payload String)
+    ENGINE = MergeTree() ORDER BY UserID SETTINGS storage_policy = 's3_load';
+
+    SYSTEM STOP MERGES test_db.table_01;
+    SYSTEM STOP MERGES test_db.table_02;
+    SYSTEM STOP MERGES test_db.table_03;
+    """
+    When we insert 4 GiB of incompressible data into test_db.table_01 on clickhouse01
+    And we insert 4 GiB of incompressible data into test_db.table_02 on clickhouse01
+    And we insert 4 GiB of incompressible data into test_db.table_03 on clickhouse01
+    # 32 MiB is the size above which ClickHouse copies an object in several
+    # parts on its own settings.
+    Then s3 bucket cloud-storage-01 contains an object larger than 33554432 bytes with prefix "data_load/"
+    When we save data part checksums in context on clickhouse01
+    And we create clickhouse01 clickhouse backup
+    """
+    name: test_backup1
+    copy_cloud_storage_data: true
+    """
+    Then s3 bucket ch-backup contains an object of several parts with prefix "ch_backup/test_backup1/cloud_storage/s3_load/"
+    When we create clickhouse01 clickhouse backup
+    """
+    name: test_backup2
+    copy_cloud_storage_data: true
+    """
+    Then s3 bucket ch-backup contains no objects with prefix "ch_backup/test_backup2/cloud_storage/"
+    When we delete all objects in s3 bucket cloud-storage-01
+    And we restore clickhouse backup "test_backup2" to clickhouse02
+    # The data itself is not read back: it does not fit into the memory of the
+    # test process. The checksums of the parts cover their contents.
+    Then data part checksums equal to saved ones on clickhouse02
+    And s3 bucket cloud-storage-02 contains an object of several parts with prefix "data_load/"

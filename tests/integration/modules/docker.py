@@ -16,7 +16,9 @@ from docker.models.containers import Container
 from . import utils
 from .typing import ContextT
 
-DOCKER_API = docker.from_env()
+# A backup of tens of gigabytes runs longer than the default timeout of a call
+# to the docker API, and the call is what waits for the command to finish.
+DOCKER_API = docker.from_env(timeout=int(os.environ.get("DOCKER_TIMEOUT", "60")))
 
 
 def get_containers(context: ContextT) -> Sequence[Container]:
