@@ -54,5 +54,6 @@ Feature: Copy of cloud storage objects that do not fit into a single CopyObject
     Then the user's data equal to saved one on clickhouse02
     And data part checksums equal to saved ones on clickhouse02
     # Restore copies the data back the same way, so it takes the multipart path
-    # as well.
-    And s3 bucket cloud-storage-01 contains an object of several parts with prefix "data_multipart/"
+    # as well. Every instance has a bucket of its own, and this is the one of
+    # the instance restored to.
+    And s3 bucket cloud-storage-02 contains an object of several parts with prefix "data_multipart/"
