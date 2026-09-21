@@ -140,6 +140,13 @@ Feature: Copy of cloud storage objects that do not fit into a single CopyObject
     SYSTEM STOP MERGES test_db.table_02;
     SYSTEM STOP MERGES test_db.table_03;
     """
+    # Data of this size lands in tens of parts, and merging them would give the
+    # restored table parts of its own, with checksums of their own. The one
+    # restored to is stopped whole: its tables do not exist yet.
+    And we have executed queries on clickhouse02
+    """
+    SYSTEM STOP MERGES;
+    """
     When we insert 4 GiB of incompressible data into test_db.table_01 on clickhouse01
     And we insert 4 GiB of incompressible data into test_db.table_02 on clickhouse01
     And we insert 4 GiB of incompressible data into test_db.table_03 on clickhouse01
