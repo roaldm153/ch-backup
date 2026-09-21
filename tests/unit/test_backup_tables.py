@@ -400,3 +400,55 @@ class TestRestorePreprocessing:
         attached_table = context.ch_ctl.attach_table.call_args.args[0]
         assert attached_table.name == expected_detached_name
         assert result == [backup_table]
+
+
+class TestCloudStorageFlags:
+    """
+    Tests that the cloud_storage options reach backup metadata.
+    """
+
+    @staticmethod
+    def _backup_with_cloud_conf(cloud_conf: dict) -> BackupMetadata:
+        """Helper: run a schema-only backup with a given cloud_storage config."""
+        config = {**DEFAULT_CONFIG, "cloud_storage": cloud_conf}
+        context = BackupContext(config)  # type: ignore[arg-type]
+        context.ch_ctl = MagicMock()
+        context.backup_meta = BackupMetadata(
+            name="20181017T210300",
+            path="ch_backup/20181017T210300",
+            version="1.0.100",
+            ch_version="19.1.16",
+            time_format="%Y-%m-%dT%H:%M:%S%Z",
+            hostname="clickhouse01.test_net_711",
+        )
+
+        TableBackup().backup(
+            context,
+            databases=[],
+            db_tables={},
+            schema_only=True,
+            multiprocessing_config={},
+        )
+
+        return context.backup_meta
+
+    @pytest.mark.parametrize(
+        "cloud_conf,encrypted,compressed",
+        [
+            ({"encryption": False, "compression": False}, False, False),
+            ({"encryption": True, "compression": True}, True, True),
+            ({}, True, True),
+        ],
+        ids=["disabled", "enabled", "absent"],
+    )
+    def test_metadata_protection_follows_the_options(
+        self, cloud_conf: dict, encrypted: bool, compressed: bool
+    ) -> None:
+        """
+        The options decide whether cloud storage metadata is encrypted and
+        compressed. Absent, they keep the default of doing both.
+        """
+        backup_meta = self._backup_with_cloud_conf(cloud_conf)
+
+        assert backup_meta.cloud_storage.encrypted is encrypted
+        assert backup_meta.cloud_storage.compressed is compressed

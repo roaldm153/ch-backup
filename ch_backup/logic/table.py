@@ -70,12 +70,12 @@ class TableBackup(BackupManager):
 
         backup_name = context.backup_meta.get_sanitized_name()
 
-        if context.cloud_conf.get("encryption", True):
-            logging.debug('Cloud Storage "shadow" backup will be encrypted')
-            context.backup_meta.cloud_storage.encrypt()
-        if context.cloud_conf.get("compression", True):
-            logging.debug('Cloud Storage "shadow" backup will be compressed')
-            context.backup_meta.cloud_storage.compress()
+        context.backup_meta.cloud_storage.encrypted = context.cloud_conf.get(
+            "encryption", True
+        )
+        context.backup_meta.cloud_storage.compressed = context.cloud_conf.get(
+            "compression", True
+        )
 
         # Since https://github.com/ClickHouse/ClickHouse/pull/75016
         if (
