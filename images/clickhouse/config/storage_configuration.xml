@@ -26,14 +26,16 @@
 				<access_key_id>{{ conf.s3.access_key_id }}</access_key_id>
 				<secret_access_key>{{ conf.s3.access_secret_key }}</secret_access_key>
 				<skip_access_check>true</skip_access_check>
-				<!-- An object above this size is copied in several parts. 5 MiB is
-				     the smallest part S3 accepts, so a copy of several parts is
-				     made by an object that still fits into a test environment. -->
-				<max_single_operation_copy_size>5242880</max_single_operation_copy_size>
-				<min_upload_part_size>5242880</min_upload_part_size>
+				<!-- Request settings of a disk are read with the "s3_" prefix and
+				     the bare name is ignored without a word, so the prefix stays.
+				     An object above the copy size is copied in several parts, and
+				     5 MiB is the smallest part S3 accepts, so a copy of several
+				     parts is made by an object that fits into a test environment. -->
+				<s3_max_single_operation_copy_size>5242880</s3_max_single_operation_copy_size>
+				<s3_min_upload_part_size>5242880</s3_min_upload_part_size>
 				<!-- Writes stay in a single part, so that a multipart ETag in the
 				     backup bucket can only have been left by the copy. -->
-				<max_single_part_upload_size>1073741824</max_single_part_upload_size>
+				<s3_max_single_part_upload_size>1073741824</s3_max_single_part_upload_size>
 			</s3_multipart>
 {% if ch_version_ge('22.8') %}
 			<s3_cache>
