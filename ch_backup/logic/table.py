@@ -77,7 +77,7 @@ class TableBackup(BackupManager):
 
         compressed = context.cloud_conf.get("compression", True)
         if compressed:
-            logging.debug('Cloud storage "shadow" backup will be compressed') 
+            logging.debug('Cloud storage "shadow" backup will be compressed')
         context.backup_meta.cloud_storage.compressed = compressed
 
         # Since https://github.com/ClickHouse/ClickHouse/pull/75016
