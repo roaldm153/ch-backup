@@ -584,7 +584,7 @@ class TestCloudStorageMetadata:
             time_format="%Y-%m-%d %H:%M:%S %z",
             hostname="clickhouse01.test_net_711",
         )
-        backup.cloud_storage.copy_data()
+        backup.cloud_storage.data_copied = True
 
         restored = BackupMetadata.load(json.loads(backup.dump_json()))
 

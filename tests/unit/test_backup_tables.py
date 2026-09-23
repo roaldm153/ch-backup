@@ -432,9 +432,9 @@ class TestRestorePreprocessing:
         assert result == [backup_table]
 
 
-class TestCloudStorageCopyDataFlag:
+class TestCloudStorageFlags:
     """
-    Tests that the cloud_storage.copy_data option reaches backup metadata.
+    Tests that the cloud_storage options reach backup metadata.
     """
 
     @staticmethod
@@ -453,11 +453,34 @@ class TestCloudStorageCopyDataFlag:
         return context.backup_meta
 
     @pytest.mark.parametrize(
+        "cloud_conf,encrypted,compressed",
+        [
+            ({"encryption": False, "compression": False}, False, False),
+            ({"encryption": True, "compression": True}, True, True),
+            ({}, True, True),
+        ],
+        ids=["disabled", "enabled", "absent"],
+    )
+    def test_metadata_protection_follows_the_options(
+        self, cloud_conf: dict, encrypted: bool, compressed: bool
+    ) -> None:
+        """
+        The options decide whether cloud storage metadata is encrypted and
+        compressed. Absent, they keep the default of doing both.
+        """
+        backup_meta = self._backup_with_cloud_conf(cloud_conf)
+
+        assert backup_meta.cloud_storage.encrypted is encrypted
+        assert backup_meta.cloud_storage.compressed is compressed
+
+    @pytest.mark.parametrize(
         "cloud_conf,data_copied",
         [({"copy_data": True}, True), ({"copy_data": False}, False), ({}, False)],
         ids=["enabled", "disabled", "absent"],
     )
-    def test_flag_follows_the_option(self, cloud_conf: dict, data_copied: bool) -> None:
+    def test_data_copying_follows_the_option(
+        self, cloud_conf: dict, data_copied: bool
+    ) -> None:
         """
         The option marks the backup as containing copied cloud storage data.
         Disabled or absent, it keeps the default of storing references only.
@@ -781,8 +804,7 @@ class TestCloudStorageDeduplication:
         """Helper: build a context backing up a table stored on cloud storage."""
         context = _make_backup_context()
         context.backup_meta.add_table(TableMetadata("db1", "table1", "MergeTree", UUID))
-        if copy_data:
-            context.backup_meta.cloud_storage.copy_data()
+        context.backup_meta.cloud_storage.data_copied = copy_data
         return context
 
     @staticmethod

@@ -50,12 +50,26 @@ class CloudStorageMetadata:
         """
         return self._encryption
 
+    @encrypted.setter
+    def encrypted(self, value: bool) -> None:
+        """
+        Set whether Cloud Storage backup is encrypted.
+        """
+        self._encryption = value
+
     @property
     def compressed(self) -> bool:
         """
         Return True if Cloud Storage backup is compressed.
         """
         return self._compression
+
+    @compressed.setter
+    def compressed(self, value: bool) -> None:
+        """
+        Set whether Cloud Storage backup is compressed.
+        """
+        self._compression = value
 
     @property
     def data_copied(self) -> bool:
@@ -64,30 +78,19 @@ class CloudStorageMetadata:
         """
         return self._data_copied
 
+    @data_copied.setter
+    def data_copied(self, value: bool) -> None:
+        """
+        Set whether Cloud Storage data is copied into the backup.
+        """
+        self._data_copied = value
+
     @property
     def requires_source_bucket(self) -> bool:
         """
         Return True if restore needs the bucket of the source installation.
         """
         return self.enabled and not self._data_copied
-
-    def encrypt(self) -> None:
-        """
-        Encrypt Cloud Storage data within the backup.
-        """
-        self._encryption = True
-
-    def compress(self) -> None:
-        """
-        Compress Cloud Storage data within the backup.
-        """
-        self._compression = True
-
-    def copy_data(self) -> None:
-        """
-        Mark that Cloud Storage data is copied into the backup.
-        """
-        self._data_copied = True
 
     @classmethod
     def load(cls, data: dict[str, Any]) -> "CloudStorageMetadata":
