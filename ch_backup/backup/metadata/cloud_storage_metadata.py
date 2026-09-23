@@ -48,6 +48,13 @@ class CloudStorageMetadata:
         """
         return self._encryption
 
+    @encrypted.setter
+    def encrypted(self, value: bool) -> None:
+        """
+        Set whether Cloud Storage backup is encrypted.
+        """
+        self._encryption = value
+
     @property
     def compressed(self) -> bool:
         """
@@ -55,17 +62,12 @@ class CloudStorageMetadata:
         """
         return self._compression
 
-    def encrypt(self) -> None:
+    @compressed.setter
+    def compressed(self, value: bool) -> None:
         """
-        Encrypt Cloud Storage data within the backup.
+        Set whether Cloud Storage backup is compressed.
         """
-        self._encryption = True
-
-    def compress(self) -> None:
-        """
-        Encrypt Cloud Storage data within the backup.
-        """
-        self._compression = True
+        self._compression = value
 
     @classmethod
     def load(cls, data: dict[str, Any]) -> "CloudStorageMetadata":
