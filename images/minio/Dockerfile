@@ -1,8 +1,6 @@
-FROM quay.io/minio/mc:RELEASE.2022-01-07T06-01-38Z
+FROM bitnamilegacy/minio:2025.7.23-debian-12-r3
 
-FROM quay.io/minio/minio:RELEASE.2022-01-08T03-11-54Z
-
-COPY --from=0 /usr/bin/mc /usr/bin/mc
+USER root
 
 ENV MINIO_ACCESS_KEY {{ conf.s3.access_key_id }}
 ENV MINIO_SECRET_KEY {{ conf.s3.access_secret_key }}
@@ -13,7 +11,7 @@ RUN mkdir -p \
     /export/{{ conf.s3.cloud_storage_bucket }}-01 \
     /export/{{ conf.s3.cloud_storage_bucket }}-02
 
-ENTRYPOINT ["/usr/bin/docker-entrypoint.sh"]
+ENTRYPOINT ["minio"]
 
 HEALTHCHECK --interval=500ms --timeout=1s --retries=60 \
     CMD curl --fail --silent http://localhost:9000/minio/health/ready
