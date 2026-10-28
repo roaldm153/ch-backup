@@ -7,6 +7,11 @@ export PROJECT_NAME ?= ch-backup
 export DEV_MODE ?= false
 export INTEGRATION_JOBS ?= 3
 export INTEGRATION_FEATURESET ?= tests/integration/ch_backup.featureset
+export BENCH_PARTS ?= 1000,3000,10000
+export CLICKHOUSE_VERSIONS ?= 25.8.23.13,26.3.12.3
+export BENCH_COLUMNS ?= 120
+export BENCH_WORKERS ?= 4
+export BASELINE_REF ?=
 
 export BUILD_PYTHON_OUTPUT_DIR ?= dist
 export BUILD_DEB_OUTPUT_DIR ?= out
@@ -111,6 +116,17 @@ test-integration: create-test-env
 .PHONY: test-integration-parallel
 test-integration-parallel: check-docker-compose build
 	uv run python -m tests.integration.parallel
+
+
+.PHONY: test-benchmark-copy-memory
+test-benchmark-copy-memory: check-docker-compose build
+	uv run python -m tests.benchmark.copy_memory run \
+	    --parts $(BENCH_PARTS) \
+	    --versions $(CLICKHOUSE_VERSIONS) \
+	    --columns $(BENCH_COLUMNS) \
+	    --workers $(BENCH_WORKERS) \
+	    $(if $(BASELINE_REF),--baseline-ref $(BASELINE_REF)) \
+	    $(BENCH_ARGS)
 
 
 .PHONY: clean
@@ -228,6 +244,7 @@ help:
 	@echo "  test-unit                  Run unit tests."
 	@echo "  test-integration           Run integration tests."
 	@echo "  test-integration-parallel  Run whole features in isolated parallel environments."
+	@echo "  test-benchmark-copy-memory Measure memory of copying data of object storage disks."
 	@echo "  isort                      Perform isort checks."
 	@echo "  black                      Perform black checks."
 	@echo "  codespell                  Perform codespell checks."
@@ -251,3 +268,6 @@ help:
 	@echo "  CLICKHOUSE_VERSION         ClickHouse version to use in integration tests (default: \"$(CLICKHOUSE_VERSION)\")."
 	@echo "  INTEGRATION_JOBS           Slot budget for test-integration-parallel (default: $(INTEGRATION_JOBS))."
 	@echo "  INTEGRATION_FEATURESET     Canonical feature list for parallel runs."
+	@echo "  BENCH_PARTS                Parts of the copy memory benchmark (default: \"$(BENCH_PARTS)\")."
+	@echo "  CLICKHOUSE_VERSIONS        ClickHouse versions of the benchmark (default: \"$(CLICKHOUSE_VERSIONS)\")."
+	@echo "  BENCH_COLUMNS, BENCH_WORKERS, BASELINE_REF, BENCH_ARGS  Other options of the benchmark."
