@@ -4,12 +4,34 @@ Unit tests of the copy memory benchmark: wrapped methods, the dataset and the re
 
 import importlib
 import json
+import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pytest
 
 from tests.benchmark.copy_memory import dataset, probe, report
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_detached_command_pid_and_exit_code(tmp_path: Path, exit_code: int) -> None:
+    """Save the command's own PID and exit code in a new directory."""
+    with patch("docker.from_env"):
+        environment = importlib.import_module("tests.benchmark.copy_memory.env")
+    workdir = tmp_path / "new directory"
+    command = [
+        sys.executable,
+        "-c",
+        f"import os, sys; print(os.getpid()); sys.exit({exit_code})",
+    ]
+    with patch.object(environment.subprocess, "run") as run:
+        environment.Environment.start_detached(Mock(), command, str(workdir))
+    subprocess.run(["bash", "-c", run.call_args.args[0][-1]], check=True)
+
+    assert (workdir / "pid").read_text() == (workdir / "output.log").read_text()
+    assert int((workdir / "rc").read_text()) == exit_code
 
 
 @pytest.mark.parametrize(

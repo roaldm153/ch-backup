@@ -105,9 +105,9 @@ class Environment:
         directory = shlex.quote(workdir)
         prefix = ["env", *(f"{k}={v}" for k, v in (env or {}).items())]
         script = (
-            f"mkdir -p {directory} && rm -f {directory}/rc && cd / && "
+            f"mkdir -p {directory} && rm -f {directory}/rc && cd / || exit; "
             f"{shlex.join([*prefix, *command])} > {directory}/output.log 2>&1 & "
-            f"echo $! > {directory}/pid; wait $!; echo $? > {directory}/rc"
+            f'pid=$!; echo "$pid" > {directory}/pid; wait "$pid"; echo $? > {directory}/rc'
         )
         subprocess.run(
             ["docker", "exec", "-d", self.container(), "bash", "-c", script],
