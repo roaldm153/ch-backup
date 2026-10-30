@@ -6,6 +6,9 @@ containers: the table, its backup, the inventory and copies under the probe. A p
 copies while the speed of the first full copy fits the next point into the time budget, and only
 plans copying after that. With metadata of version 5, rewritten disk metadata is also uploaded
 without copying objects, so the resume can be measured.
+
+Every copy has a wall-clock limit, including the first. Reports are refreshed after preparing
+the backup and after each copy. Logs are saved before removing containers on success or failure.
 """
 
 import json
@@ -17,7 +20,7 @@ from pathlib import Path
 
 import yaml
 
-from tests.benchmark.copy_memory import dataset, inventory
+from tests.benchmark.copy_memory import dataset, inventory, report
 from tests.benchmark.copy_memory.env import TARGET_BUCKET, Environment
 from tests.integration.modules.utils import merge
 
@@ -47,7 +50,8 @@ class Options:
     columns: int = 120
     workers: int = 4
     baseline_ref: str | None = None
-    budget_hours: float = 3
+    budget_hours: float = 120
+    freeze_timeout: int = 21600
     planning_only_from: int | None = None
     interval: float = 0.5
     results: Path = field(
@@ -136,6 +140,7 @@ class Driver:
         self.options = options
         self.results = options.results
         self.speed: float | None = None
+        self.full_copy_timed_out = False
 
     def run(self) -> None:
         """Run all versions and points."""
@@ -159,6 +164,7 @@ class Driver:
             _log(f"ClickHouse {version}: building images")
             env.create()
             self.speed = None
+            self.full_copy_timed_out = False
             for parts in sorted(self.options.parts):
                 self._point(env, version, parts)
         _log(f"Results: {self.results}")
@@ -171,18 +177,22 @@ class Driver:
         timings = point["timings"]
         _log(f"ClickHouse {version}, {parts} parts")
         started = time.monotonic()
-        env.start()
         try:
+            env.start()
             timings["start"] = time.monotonic() - started
             self._configure(env)
             dataset.create_table(env, self.options.columns, parts)
             timings["insert"] = dataset.insert_parts(env, self.options.columns, parts)
             dataset.check_parts(env, parts)
             timings["backup"] = self._backup(env, point_dir)
+            point["status"] = "backup_completed"
+            self._checkpoint(point_dir, point)
             started = time.monotonic()
             inv = inventory.collect(env, parts, BACKUP_NAME, CONFIG_PATH)
             timings["inventory"] = time.monotonic() - started
             _write_json(point_dir / "inventory.json", inv)
+            point["status"] = "copying"
+            self._checkpoint(point_dir, point)
             objects = inv["unique_objects"]
             full = self._fits(parts, objects)
             point["mode"] = "full" if full else "planning_only"
@@ -197,17 +207,58 @@ class Driver:
                     variants.append("baseline")
                 for variant in variants:
                     run.variant = variant
-                    point["runs"].append(self._probe(env, point_dir, run))
-                    _write_json(point_dir / "point.json", point)
-        except Exception as e:
+                    result = self._probe(env, point_dir, run)
+                    point["runs"].append(result)
+                    self._checkpoint(point_dir, point)
+                    if result["outcome"] == "timeout":
+                        self.full_copy_timed_out |= run.mode == "full"
+                        point["status"] = "timeout"
+                        point["error"] = (
+                            f"{run.name} exceeded {self.options.budget_hours} hours"
+                        )
+                        return
+                    if result["exit_code"] and not (
+                        run.kind == "interrupted" and result["interrupted"]
+                    ):
+                        raise RuntimeError(
+                            f"{run.name} exited with {result['exit_code']}"
+                        )
+            point["status"] = "completed"
+        except (Exception, KeyboardInterrupt) as e:
+            point["status"] = "failed"
             point["error"] = f"{type(e).__name__}: {e}"
             _log(f"Point failed: {point['error']}")
+            if isinstance(e, KeyboardInterrupt):
+                raise
         finally:
-            _write_json(point_dir / "point.json", point)
+            self._finish_point(env, point_dir, point)
+
+    def _finish_point(self, env: Environment, point_dir: Path, point: dict) -> None:
+        """Save logs and the report before cleaning up any completed or failed point."""
+        try:
+            env.save_diagnostics(point_dir / "diagnostics")
+        except Exception as e:
+            point["diagnostics_error"] = f"{type(e).__name__}: {e}"
+            _log(f"Diagnostics failed: {e}")
+        try:
+            self._checkpoint(point_dir, point)
+        finally:
             env.stop()
+
+    def _checkpoint(self, point_dir: Path, point: dict) -> None:
+        """Save the point and refresh the report without losing results if plotting fails."""
+        _write_json(point_dir / "point.json", point)
+        try:
+            report.build(self.results)
+        except Exception as e:
+            point["report_error"] = f"{type(e).__name__}: {e}"
+            _write_json(point_dir / "point.json", point)
+            _log(f"Report failed: {e}")
 
     def _fits(self, parts: int, objects: int) -> bool:
         """Check that full copies of the point fit into the time budget."""
+        if self.full_copy_timed_out:
+            return False
         if self.options.planning_only_from and parts >= self.options.planning_only_from:
             return False
         if self.speed is None:
@@ -236,6 +287,9 @@ class Driver:
                 "ch-backup",
                 "-c",
                 ORIGINAL_CONFIG_PATH,
+                "--config-parameter",
+                "clickhouse.freeze_timeout",
+                str(self.options.freeze_timeout),
                 "backup",
                 "--name",
                 BACKUP_NAME,
@@ -303,7 +357,8 @@ class Driver:
                 env.signal_detached(workdir)
                 interrupted = True
 
-        env.start_detached(command, workdir, variables)
+        budget = self.options.budget_hours * 3600
+        env.start_detached(command, workdir, variables, timeout=budget)
         code = env.wait_detached(workdir, poll)
         duration = time.monotonic() - started
         env.chown(workdir)
@@ -312,7 +367,11 @@ class Driver:
             **asdict(run),
             "exit_code": code,
             "duration": duration,
-            "outcome": summary.get("outcome"),
+            "outcome": (
+                "timeout"
+                if code == 124 or (code == 137 and duration >= budget)
+                else summary.get("outcome")
+            ),
             "interrupted": interrupted,
             "oom_events": _oom_events(wall_start),
         }

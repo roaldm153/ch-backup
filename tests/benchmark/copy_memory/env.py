@@ -99,11 +99,23 @@ class Environment:
             time.sleep(1)
 
     def start_detached(
-        self, command: list[str], workdir: str, env: dict | None = None
+        self,
+        command: list[str],
+        workdir: str,
+        env: dict | None = None,
+        timeout: float | None = None,
     ) -> None:
         """Start the command in the background, saving its PID, output and exit code to workdir."""
         directory = shlex.quote(workdir)
         prefix = ["env", *(f"{k}={v}" for k, v in (env or {}).items())]
+        if timeout is not None:
+            prefix = [
+                "timeout",
+                "--signal=TERM",
+                "--kill-after=60s",
+                f"{timeout}s",
+                *prefix,
+            ]
         script = (
             f"mkdir -p {directory} && rm -f {directory}/rc && cd / || exit; "
             f"{shlex.join([*prefix, *command])} > {directory}/output.log 2>&1 & "
@@ -132,11 +144,55 @@ class Environment:
 
     def signal_detached(self, workdir: str, signal: str = "TERM") -> None:
         """Send the signal to the detached command."""
-        self.exec(f"kill -{signal} $(cat {shlex.quote(workdir + '/pid')})")
+        directory = shlex.quote(workdir)
+        self.exec(
+            f"test -f {directory}/rc || kill -{signal} $(cat {directory}/pid) "
+            f"|| test -f {directory}/rc"
+        )
 
     def chown(self, path: str) -> None:
         """Give files written in the container to the user of the host."""
         self.exec(f"chown -R {os.getuid()}:{os.getgid()} {shlex.quote(path)}")
+
+    def save_diagnostics(self, destination: Path) -> None:
+        """Save retained log files and running FREEZE queries before removing containers."""
+        destination.mkdir(parents=True, exist_ok=True)
+        commands = {
+            "server-logs.tar": ["docker", "cp", f"{self.container()}:/var/log/.", "-"],
+            "freeze.jsonl": [
+                "docker",
+                "exec",
+                self.container(),
+                "clickhouse-client",
+                "--query",
+                "SELECT query_id, elapsed, read_rows, read_bytes, memory_usage, ProfileEvents "
+                "FROM system.processes WHERE query LIKE 'ALTER TABLE%FREEZE%' FORMAT JSONEachRow",
+            ],
+            "seaweedfs.log": [
+                "docker",
+                "logs",
+                self.container("seaweedfs01"),
+            ],
+        }
+        for name, command in commands.items():
+            with (
+                (destination / name).open("wb") as output,
+                (destination / f"{name}.errors").open("w", encoding="utf-8") as errors,
+            ):
+                try:
+                    result = subprocess.run(
+                        command,
+                        stdout=output,
+                        stderr=errors,
+                        timeout=120,
+                        check=False,
+                    )
+                    if result.returncode:
+                        errors.write(
+                            f"\nDiagnostics command exited with {result.returncode}\n"
+                        )
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    errors.write(f"\nDiagnostics failed: {error}\n")
 
     def reset_copy_state(self, path_root: str, backup_name: str) -> None:
         """Return the copy in the target storage to the state "creating", so the next copy resumes it."""

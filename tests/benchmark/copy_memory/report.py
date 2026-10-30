@@ -133,7 +133,12 @@ def series_points(
         if point["version"] != version:
             continue
         for run in point["runs"]:
-            if run["variant"] == "candidate" and run["kind"] in names and run["stages"]:
+            if (
+                run["variant"] == "candidate"
+                and run["kind"] in names
+                and run["stages"]
+                and run["exit_code"] == 0
+            ):
                 result.append(
                     (
                         objects(point, run),
@@ -395,7 +400,11 @@ def bytes_per_object(
         if point["version"] != version:
             continue
         for run in point["runs"]:
-            if run["variant"] != "candidate" or run["kind"] not in FRESH_RUNS:
+            if (
+                run["variant"] != "candidate"
+                or run["kind"] not in FRESH_RUNS
+                or run["exit_code"] != 0
+            ):
                 continue
             for stage, row in stage_table(run["stages"]).items():
                 by_stage[stage].append(
@@ -440,24 +449,45 @@ def _run_lines(points: list[dict]) -> list[str]:
     lines: list[str] = []
     lines += ["", "## Пики по прогонам", ""]
     lines.append(
-        "| Версия | Партов | Прогон | Режим | Код | Время, с | Объектов | "
+        "| Версия | Партов | Прогон | Режим | Статус | Код | Время, с | Объектов | "
         "Основной, ГиБ | Воркер, ГиБ | Сумма, ГиБ | Байт на объект (основной) |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for point in points:
         for run in point["runs"]:
-            if not run["stages"]:
-                continue
             run_peaks = peaks(run["stages"])
             count = objects(point, run)
             lines.append(
                 f"| {point['version']} | {point['parts']} | {run['kind']}-{run['variant']} "
-                f"| {run['mode']} | {run['exit_code']} | {run['duration']:.0f} | {count} "
+                f"| {run['mode']} | {run.get('outcome', 'unknown')} "
+                f"| {run['exit_code']} | {run['duration']:.0f} | {count} "
                 f"| {run_peaks['main'] / GIB:.2f} | {run_peaks['worker'] / GIB:.2f} "
                 f"| {run_peaks['total'] / GIB:.2f} "
                 f"| {run_peaks['main'] / count if count else 0:.0f} |"
             )
     return lines
+
+
+def _status_lines(points: list[dict]) -> list[str]:
+    """Show preparation results and failures even when no copy has finished."""
+    lines = [
+        "## Состояние точек",
+        "",
+        "| Версия | Партов | Статус | Backup, с | Ошибка |",
+        "|---|---|---|---|---|",
+    ]
+    for point in points:
+        errors = "; ".join(
+            str(point[key])
+            for key in ("error", "diagnostics_error", "report_error")
+            if point.get(key)
+        )
+        errors = errors.replace("|", "\\|").replace("\n", " ")
+        lines.append(
+            f"| {point['version']} | {point['parts']} | {point.get('status', 'unknown')} "
+            f"| {point.get('timings', {}).get('backup', 0):.0f} | {errors} |"
+        )
+    return lines + [""]
 
 
 def _stage_lines(points: list[dict]) -> list[str]:
@@ -530,6 +560,7 @@ def _structure_lines(structures: list) -> list[str]:
 def render_markdown(points: list[dict], structures: list) -> str:
     """Return report.md with inventory, peaks, stages and the forecast."""
     lines = ["# Память ch-backup copy", ""]
+    lines += _status_lines(points)
     lines += _inventory_lines(points)
     lines += _run_lines(points)
     lines += _stage_lines(points)
@@ -541,6 +572,8 @@ def render_markdown(points: list[dict], structures: list) -> str:
         "",
         "Сумма пиков складывает пики основного процесса и воркеров внутри этапа, "
         "это верхняя оценка: пики могли прийтись на разное время.",
+        "Незавершённые прогоны содержат только успевшие записаться замеры "
+        "и не участвуют в экстраполяции; ноль при отсутствии замеров не означает нулевую память.",
         "",
         "![Пики от числа объектов](peak_vs_objects.png)",
         "",

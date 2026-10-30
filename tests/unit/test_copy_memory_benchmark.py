@@ -4,6 +4,8 @@ Unit tests of the copy memory benchmark: wrapped methods, the dataset and the re
 
 import importlib
 import json
+import shlex
+import shutil
 import subprocess
 import sys
 from collections import Counter
@@ -32,6 +34,172 @@ def test_detached_command_pid_and_exit_code(tmp_path: Path, exit_code: int) -> N
 
     assert (workdir / "pid").read_text() == (workdir / "output.log").read_text()
     assert int((workdir / "rc").read_text()) == exit_code
+
+
+def test_detached_timeout(tmp_path: Path) -> None:
+    """Stop a sleeping command and record GNU timeout's exit code."""
+    executable = shutil.which("timeout") or shutil.which("gtimeout")
+    if not executable:
+        pytest.skip("GNU timeout is available in the Linux benchmark container")
+    with patch("docker.from_env"):
+        environment = importlib.import_module("tests.benchmark.copy_memory.env")
+    command = [sys.executable, "-c", "import time; time.sleep(60)"]
+    with patch.object(environment.subprocess, "run") as run:
+        environment.Environment.start_detached(
+            Mock(), command, str(tmp_path), timeout=0.1
+        )
+    script = run.call_args.args[0][-1].replace(
+        "timeout --signal", f"{shlex.quote(executable)} --signal"
+    )
+    subprocess.run(["bash", "-c", script], check=True, timeout=5)
+    assert int((tmp_path / "rc").read_text()) == 124
+
+
+def test_backup_freeze_timeout(tmp_path: Path) -> None:
+    """Pass the requested timeout to the source backup, outside the measured copy."""
+    with patch("docker.from_env"):
+        driver = importlib.import_module("tests.benchmark.copy_memory.driver")
+    options = driver.Options(
+        parts=[10000], versions=["25.8.23.13"], freeze_timeout=21600
+    )
+    benchmark = driver.Driver(options)
+    env = Mock()
+    env.wait_detached.return_value = 0
+    with patch.object(driver, "in_container", return_value="/code/backup"):
+        benchmark._backup(env, tmp_path)  # pylint: disable=protected-access
+    command = env.start_detached.call_args.args[0]
+    index = command.index("--config-parameter")
+    assert command[index + 1 : index + 4] == [
+        "clickhouse.freeze_timeout",
+        "21600",
+        "backup",
+    ]
+
+
+def test_failed_point_saves_diagnostics_before_cleanup(tmp_path: Path) -> None:
+    """Keep diagnostic files before removing a failed point's containers."""
+    with patch("docker.from_env"):
+        driver = importlib.import_module("tests.benchmark.copy_memory.driver")
+    options = driver.Options(parts=[10000], versions=["25.8.23.13"], results=tmp_path)
+    benchmark = driver.Driver(options)
+    env = Mock()
+    with patch.object(benchmark, "_configure", side_effect=RuntimeError("failed")):
+        benchmark._point(env, "25.8.23.13", 10000)  # pylint: disable=protected-access
+    names = [call[0] for call in env.mock_calls]
+    assert names.index("save_diagnostics") < names.index("stop")
+    point = json.loads((tmp_path / "25.8.23.13/10000/point.json").read_text())
+    assert point["error"] == "RuntimeError: failed"
+    assert "RuntimeError: failed" in (tmp_path / "report.md").read_text()
+
+
+def test_diagnostics_survive_command_timeout(tmp_path: Path) -> None:
+    """Try remaining diagnostics if one command times out."""
+    with patch("docker.from_env"):
+        environment = importlib.import_module("tests.benchmark.copy_memory.env")
+    with patch.object(
+        environment.subprocess,
+        "run",
+        side_effect=[subprocess.TimeoutExpired("tail", 30), Mock(), Mock()],
+    ) as run:
+        environment.Environment.save_diagnostics(Mock(), tmp_path)
+    assert run.call_count == 3
+    assert "Diagnostics failed" in (tmp_path / "server-logs.tar.errors").read_text()
+    assert (tmp_path / "freeze.jsonl").exists()
+    assert (tmp_path / "seaweedfs.log").exists()
+
+
+@pytest.mark.parametrize(
+    "code,duration,outcome",
+    [
+        (0, 1, "completed"),
+        (124, 432001, "timeout"),
+        (137, 432060, "timeout"),
+        (137, 1, "failed"),
+    ],
+)
+def test_probe_budget(tmp_path: Path, code: int, duration: float, outcome: str) -> None:
+    """Apply the deadline to the first copy and distinguish an early process kill."""
+    with patch("docker.from_env"):
+        driver = importlib.import_module("tests.benchmark.copy_memory.driver")
+    benchmark = driver.Driver(driver.Options(parts=[10000], versions=["26.3.12.3"]))
+    env = Mock()
+    env.wait_detached.return_value = code
+    with (
+        patch.object(driver, "in_container", return_value="/code/fresh"),
+        patch.object(driver, "_oom_events", return_value=[]),
+        patch.object(
+            driver,
+            "_read_json",
+            return_value={"outcome": "completed" if code == 0 else "failed"},
+        ),
+        patch.object(driver.time, "monotonic", side_effect=[0, duration]),
+    ):
+        result = benchmark._probe(  # pylint: disable=protected-access
+            env, tmp_path, driver.Run("fresh", "full", "fresh")
+        )
+    assert env.start_detached.call_args.kwargs["timeout"] == 120 * 3600
+    assert result["outcome"] == outcome
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_point_checkpoints_and_logs(tmp_path: Path, timeout: bool) -> None:
+    """Report preparation and each copy, keep logs and stop after a timeout."""
+    with patch("docker.from_env"):
+        driver = importlib.import_module("tests.benchmark.copy_memory.driver")
+    benchmark = driver.Driver(
+        driver.Options(parts=[10000], versions=["26.3.12.3"], results=tmp_path)
+    )
+    env = Mock()
+    point_dir = tmp_path / "26.3.12.3/10000"
+    checkpoints = []
+
+    def snapshot(_root):
+        """Capture the persisted point at each report refresh."""
+        checkpoints.append(json.loads((point_dir / "point.json").read_text()))
+
+    result = {
+        "exit_code": 124 if timeout else 0,
+        "outcome": "timeout" if timeout else "completed",
+        "interrupted": False,
+    }
+    with (
+        patch.object(benchmark, "_configure"),
+        patch.object(benchmark, "_backup", return_value=10),
+        patch.object(benchmark, "_probe", return_value=result) as run,
+        patch.object(driver.dataset, "create_table"),
+        patch.object(driver.dataset, "insert_parts", return_value=1),
+        patch.object(driver.dataset, "check_parts"),
+        patch.object(
+            driver.inventory,
+            "collect",
+            return_value={"unique_objects": 100, "metadata_format_version": 5},
+        ),
+        patch.object(driver.report, "build", side_effect=snapshot),
+    ):
+        benchmark._point(env, "26.3.12.3", 10000)  # pylint: disable=protected-access
+    assert checkpoints[0]["status"] == "backup_completed"
+    assert checkpoints[0]["timings"]["backup"] == 10
+    assert checkpoints[1]["status"] == "copying"
+    assert len(checkpoints[2]["runs"]) == 1
+    assert checkpoints[-1]["status"] == ("timeout" if timeout else "completed")
+    assert run.call_count == (1 if timeout else 4)
+    assert benchmark.full_copy_timed_out == timeout
+    names = [call[0] for call in env.mock_calls]
+    assert names.index("save_diagnostics") < names.index("stop")
+    if timeout:
+        assert not benchmark._fits(20000, 200)  # pylint: disable=protected-access
+
+
+def test_timeout_excluded_from_forecast(tmp_path: Path) -> None:
+    """Retain partial peaks in the report without using them to forecast a complete run."""
+    _write_point(tmp_path, 1000, 300000)
+    _write_point(tmp_path, 3000, 900000)
+    points = report.load(tmp_path)
+    run = points[1]["runs"][0]
+    run.update(exit_code=124, outcome="timeout")
+    assert len(report.series_points(points, "25.8.23.13", "main", "fresh")) == 1
+    assert not report.bytes_per_object(points, "25.8.23.13")
+    assert "timeout" in report.render_markdown(points, [])
 
 
 @pytest.mark.parametrize(
