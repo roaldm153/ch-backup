@@ -12,6 +12,7 @@ import json
 import statistics
 from collections import defaultdict
 from pathlib import Path
+from typing import Iterator
 
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
@@ -53,13 +54,47 @@ def load(root: Path) -> list[dict]:
             run_dir = point_file.parent / f"{run['kind']}-{run['variant']}"
             run["dir"] = run_dir
             run["stages"] = _read_lines(run_dir / "stages.jsonl")
-            summary_file = run_dir / "summary.json"
-            run["summary"] = (
-                json.loads(summary_file.read_text()) if summary_file.exists() else {}
-            )
+            _load_run(run, run_dir)
         points.append(point)
     points.sort(key=lambda p: (p["version"], p["parts"]))
     return points
+
+
+def _load_run(run: dict, run_dir: Path) -> None:
+    """Recover partial samples and a finished probe even if the driver did not record it."""
+    try:
+        run["summary"] = json.loads((run_dir / "summary.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        run["summary"] = {}
+    run["sample_stats"] = sample_stats(run_dir / "samples.csv")
+    run["duration"] = max(run.get("duration", 0), run["sample_stats"].get("t", 0))
+    if run.get("exit_code") is None:
+        try:
+            code = int((run_dir / "rc").read_text())
+        except (FileNotFoundError, ValueError):
+            code = run["summary"].get("exit_code")
+        if code is not None:
+            run["exit_code"] = code
+            run["outcome"] = (
+                "timeout"
+                if code == 124
+                else run["summary"].get(
+                    "outcome", "completed" if code == 0 else "failed"
+                )
+            )
+
+
+def sample_stats(path: Path) -> dict:
+    """Summarize observed RSS without requiring the current stage to finish."""
+    result: dict = {}
+    for row in _samples(path):
+        for name in ("main_rss", "workers_rss"):
+            value = int(row[name])
+            result[name] = value
+            result[f"peak_{name}"] = max(result.get(f"peak_{name}", 0), value)
+        result["t"] = float(row["t"])
+        result["stage"] = row["stage"]
+    return result
 
 
 def peaks(stages: list[dict]) -> dict[str, int]:
@@ -171,6 +206,13 @@ def _figure(columns: int, height: float = 4.5) -> tuple[Figure, list[Axes]]:
     return fig, axes
 
 
+def _save_figure(fig: Figure, out: Path) -> None:
+    """Replace a finished chart atomically, preserving the previous chart on failure."""
+    temporary = out.with_suffix(".tmp.png")
+    fig.savefig(temporary, dpi=150, bbox_inches="tight", facecolor=SURFACE)
+    temporary.replace(out)
+
+
 def _plot_version_peaks(ax: Axes, points: list[dict], version: str) -> None:
     """Plot peak series of one version with their fits."""
     forecasts: list[float] = []
@@ -238,7 +280,7 @@ def plot_peaks(points: list[dict], out: Path) -> None:
         y=1.02,
     )
     fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight", facecolor=SURFACE)
+    _save_figure(fig, out)
 
 
 def largest_fresh_runs(points: list[dict]) -> dict[str, tuple[dict, dict]]:
@@ -289,12 +331,12 @@ def plot_stage_peaks(points: list[dict], out: Path) -> None:
         )
         ax.set_xlabel("пик RSS основного процесса, ГиБ", color=INK_SECONDARY)
     fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight", facecolor=SURFACE)
+    _save_figure(fig, out)
 
 
 def plot_timeline(point: dict, run: dict, out: Path) -> None:
     """Plot memory of the main process and workers over time with bands of stages."""
-    samples = _read_samples(run["dir"] / "samples.csv")
+    samples = list(_samples(run["dir"] / "samples.csv"))
     if not samples:
         return
     fig, axes = _figure(1)
@@ -347,7 +389,7 @@ def plot_timeline(point: dict, run: dict, out: Path) -> None:
         fontsize=11,
     )
     fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight", facecolor=SURFACE)
+    _save_figure(fig, out)
 
 
 def top_structures(run: dict) -> tuple[str, list[dict]] | None:
@@ -387,7 +429,7 @@ def plot_structures(points: list[dict], out: Path) -> list[tuple[dict, str, list
             fontsize=11,
         )
     fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight", facecolor=SURFACE)
+    _save_figure(fig, out)
     return found
 
 
@@ -457,13 +499,19 @@ def _run_lines(points: list[dict]) -> list[str]:
         for run in point["runs"]:
             run_peaks = peaks(run["stages"])
             count = objects(point, run)
+            values = (
+                [f"{run_peaks[key] / GIB:.2f}" for key in ("main", "worker", "total")]
+                if run["stages"]
+                else ["—"] * 3
+            )
+            per_object = (
+                f"{run_peaks['main'] / count:.0f}" if count and run["stages"] else "—"
+            )
             lines.append(
                 f"| {point['version']} | {point['parts']} | {run['kind']}-{run['variant']} "
                 f"| {run['mode']} | {run.get('outcome', 'unknown')} "
                 f"| {run['exit_code']} | {run['duration']:.0f} | {count} "
-                f"| {run_peaks['main'] / GIB:.2f} | {run_peaks['worker'] / GIB:.2f} "
-                f"| {run_peaks['total'] / GIB:.2f} "
-                f"| {run_peaks['main'] / count if count else 0:.0f} |"
+                f"| {' | '.join(values)} | {per_object} |"
             )
     return lines
 
@@ -488,6 +536,34 @@ def _status_lines(points: list[dict]) -> list[str]:
             f"| {point.get('timings', {}).get('backup', 0):.0f} | {errors} |"
         )
     return lines + [""]
+
+
+def _sample_lines(points: list[dict]) -> list[str]:
+    """Show the latest RSS and sampled maxima, including unfinished stages."""
+    lines = [
+        "",
+        "## RAM по периодическим замерам",
+        "",
+        "Последний записанный замер не подтверждает, что процесс сейчас работает. "
+        "Воркеры — суммарный RSS. Максимумы по выборке могут пропустить "
+        "короткие пики между замерами.",
+        "",
+        "| Версия | Партов | Прогон | Статус | Последний замер, с от старта | Этап | "
+        "RSS основной / воркеры, ГиБ | Максимум RSS основной / воркеры, ГиБ |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for point in points:
+        for run in point["runs"]:
+            stats = run.get("sample_stats")
+            if not stats:
+                continue
+            lines.append(
+                f"| {point['version']} | {point['parts']} | {run['kind']}-{run['variant']} "
+                f"| {run.get('outcome', 'unknown')} | {stats['t']:.1f} | {stats['stage']} "
+                f"| {stats['main_rss'] / GIB:.2f} / {stats['workers_rss'] / GIB:.2f} "
+                f"| {stats['peak_main_rss'] / GIB:.2f} / {stats['peak_workers_rss'] / GIB:.2f} |"
+            )
+    return lines
 
 
 def _stage_lines(points: list[dict]) -> list[str]:
@@ -563,6 +639,12 @@ def render_markdown(points: list[dict], structures: list) -> str:
     lines += _status_lines(points)
     lines += _inventory_lines(points)
     lines += _run_lines(points)
+    lines += _sample_lines(points)
+    for point in points:
+        for run in point["runs"]:
+            if run.get("sample_stats"):
+                name = f"{point['version']}_{point['parts']}_{run['kind']}-{run['variant']}"
+                lines += ["", f"![RAM: {name}](timeline_{name}.png)", ""]
     lines += _stage_lines(points)
     lines += _forecast_lines(points)
     if structures:
@@ -573,7 +655,7 @@ def render_markdown(points: list[dict], structures: list) -> str:
         "Сумма пиков складывает пики основного процесса и воркеров внутри этапа, "
         "это верхняя оценка: пики могли прийтись на разное время.",
         "Незавершённые прогоны содержат только успевшие записаться замеры "
-        "и не участвуют в экстраполяции; ноль при отсутствии замеров не означает нулевую память.",
+        "и не участвуют в экстраполяции; прочерк означает отсутствие замеров.",
         "",
         "![Пики от числа объектов](peak_vs_objects.png)",
         "",
@@ -599,7 +681,9 @@ def build(root: Path) -> None:
                 / f"timeline_{point['version']}_{point['parts']}_{run['kind']}-{run['variant']}.png",
             )
     structures = plot_structures(points, root / "structures.png")
-    (root / "report.md").write_text(render_markdown(points, structures))
+    temporary = root / "report.tmp.md"
+    temporary.write_text(render_markdown(points, structures))
+    temporary.replace(root / "report.md")
 
 
 def _bars_height(bars: int) -> float:
@@ -667,9 +751,16 @@ def _read_lines(path: Path) -> list[dict]:
     return result
 
 
-def _read_samples(path: Path) -> list[dict]:
-    """Read samples of memory."""
+def _samples(path: Path) -> Iterator[dict]:
+    """Read complete samples, ignoring a last row interrupted by a write or process death."""
     if not path.exists():
-        return []
+        return
     with path.open(newline="") as f:
-        return [row for row in csv.DictReader(f) if row.get("main_rss")]
+        for row in csv.DictReader(line for line in f if line.endswith("\n")):
+            try:
+                float(row["t"])
+                for name in ("main_rss", "workers_rss", "workers_uss"):
+                    int(row[name])
+            except (KeyError, TypeError, ValueError):
+                continue
+            yield row

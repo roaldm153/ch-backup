@@ -202,6 +202,99 @@ def test_timeout_excluded_from_forecast(tmp_path: Path) -> None:
     assert "timeout" in report.render_markdown(points, [])
 
 
+def test_live_run_records_before_start_and_after_failure(tmp_path: Path) -> None:
+    """Keep the run and periodic checkpoints when the probe fails before returning."""
+    with patch("docker.from_env"):
+        driver = importlib.import_module("tests.benchmark.copy_memory.driver")
+    benchmark = driver.Driver(
+        driver.Options(parts=[10000], versions=["26.3"], results=tmp_path)
+    )
+    point: dict = {"runs": []}
+    snapshots = []
+
+    def snapshot(_root):
+        """Read the manifest as an external report reader would."""
+        snapshots.append(json.loads((tmp_path / "point.json").read_text()))
+
+    def fail(_env, _directory, _run, refresh):
+        """Fail after two polls, only one of which should refresh the report."""
+        assert snapshots[0]["runs"][0]["outcome"] == "running"
+        refresh()
+        refresh()
+        raise RuntimeError("probe lost")
+
+    with (
+        patch.object(driver.report, "build", side_effect=snapshot),
+        patch.object(benchmark, "_probe", side_effect=fail),
+        patch.object(driver.time, "monotonic", side_effect=[0, 30, 61, 62]),
+        pytest.raises(RuntimeError, match="probe lost"),
+    ):
+        benchmark._run(  # pylint: disable=protected-access
+            Mock(), tmp_path, point, driver.Run("fresh", "full", "fresh")
+        )
+    assert len(snapshots) == 3
+    assert snapshots[1]["runs"][0]["duration"] == 61
+    assert snapshots[-1]["runs"][0]["outcome"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    "code,outcome", [(None, "running"), (137, "failed"), (124, "timeout")]
+)
+def test_report_without_finished_stages(
+    tmp_path: Path, code: int | None, outcome: str
+) -> None:
+    """Report samples even if SIGKILL prevented stage and summary files from being written."""
+    _write_point(tmp_path, 1000, 300000)
+    point_file = tmp_path / "25.8.23.13/1000/point.json"
+    point = json.loads(point_file.read_text())
+    point["runs"] = point["runs"][:1]
+    point["runs"][0].update(exit_code=None, outcome="running", duration=0)
+    point_file.write_text(json.dumps(point))
+    run_dir = point_file.parent / "fresh-candidate"
+    (run_dir / "stages.jsonl").write_text('{"unfinished":')
+    (run_dir / "summary.json").write_text('{"outcome":')
+    (run_dir / "samples.csv").write_text(
+        ",".join(probe.SAMPLE_FIELDS)
+        + "\n"
+        + f"1,copy_cloud_storage,{3 * report.GIB},0,0,0,4,{report.GIB},0,0,0\n"
+        + f"2,copy_cloud_storage,{2 * report.GIB},0,0,0,4,{report.GIB},0,0,0\n"
+        + "3,copy_cloud_storage,999999999999"
+    )
+    if code is not None:
+        (run_dir / "rc").write_text(str(code))
+    report.build(tmp_path)
+    loaded = report.load(tmp_path)
+    run = loaded[0]["runs"][0]
+    assert run["outcome"] == outcome
+    assert run["sample_stats"]["t"] == 2
+    assert run["sample_stats"]["peak_main_rss"] == 3 * report.GIB
+    assert run["sample_stats"]["main_rss"] == 2 * report.GIB
+    assert not report.series_points(loaded, "25.8.23.13", "main", "fresh")
+    markdown = (tmp_path / "report.md").read_text()
+    assert "2.00 / 1.00" in markdown
+    assert "3.00 / 1.00" in markdown
+    assert "timeline_25.8.23.13_1000_fresh-candidate.png" in markdown
+    assert outcome in markdown
+    assert (
+        tmp_path / "timeline_25.8.23.13_1000_fresh-candidate.png"
+    ).stat().st_size > 0
+
+
+def test_interrupted_chart_keeps_previous_file(tmp_path: Path) -> None:
+    """Do not replace the last usable chart with a half-written image."""
+    out = tmp_path / "chart.png"
+    out.write_bytes(b"previous chart")
+
+    def fail(path, **_kwargs):
+        """Simulate a renderer dying after writing only part of a PNG."""
+        path.write_bytes(b"partial chart")
+        raise RuntimeError("render failed")
+
+    with pytest.raises(RuntimeError, match="render failed"):
+        report._save_figure(Mock(savefig=fail), out)  # pylint: disable=protected-access
+    assert out.read_bytes() == b"previous chart"
+
+
 @pytest.mark.parametrize(
     "module,owner,name",
     [stage[:3] for stage in probe.STAGES] + list(probe.HOOKS),

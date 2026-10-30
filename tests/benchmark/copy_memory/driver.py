@@ -17,6 +17,7 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import yaml
 
@@ -33,6 +34,7 @@ SESSIONS_DIR = Path("staging/benchmark/sessions")
 TARGET_CLOUD_BUCKET = "cloud-storage-02"
 TRACEMALLOC_OBJECTS = 300_000
 INTERRUPT_AT = 0.9
+REPORT_INTERVAL = 60
 CLICKHOUSE_LOG_CONFIG = """<clickhouse>
     <logger>
         <level>information</level>
@@ -207,9 +209,7 @@ class Driver:
                     variants.append("baseline")
                 for variant in variants:
                     run.variant = variant
-                    result = self._probe(env, point_dir, run)
-                    point["runs"].append(result)
-                    self._checkpoint(point_dir, point)
+                    result = self._run(env, point_dir, point, run)
                     if result["outcome"] == "timeout":
                         self.full_copy_timed_out |= run.mode == "full"
                         point["status"] = "timeout"
@@ -254,6 +254,36 @@ class Driver:
             point["report_error"] = f"{type(e).__name__}: {e}"
             _write_json(point_dir / "point.json", point)
             _log(f"Report failed: {e}")
+
+    def _run(self, env: Environment, point_dir: Path, point: dict, run: Run) -> dict:
+        """Record the run before starting it and refresh partial results while it runs."""
+        result = {
+            **asdict(run),
+            "exit_code": None,
+            "duration": 0.0,
+            "outcome": "running",
+        }
+        point["runs"].append(result)
+        self._checkpoint(point_dir, point)
+        started = last_report = time.monotonic()
+
+        def refresh() -> None:
+            """Refresh the report at most once a minute."""
+            nonlocal last_report
+            now = time.monotonic()
+            if now - last_report >= REPORT_INTERVAL:
+                result["duration"] = now - started
+                self._checkpoint(point_dir, point)
+                last_report = time.monotonic()
+
+        try:
+            result.update(self._probe(env, point_dir, run, refresh))
+        except BaseException:
+            result["outcome"] = "incomplete"
+            raise
+        finally:
+            self._checkpoint(point_dir, point)
+        return result
 
     def _fits(self, parts: int, objects: int) -> bool:
         """Check that full copies of the point fit into the time budget."""
@@ -304,7 +334,13 @@ class Driver:
             raise RuntimeError(f"Backup exited with {code}, see {point_dir}/backup")
         return time.monotonic() - started
 
-    def _probe(self, env: Environment, point_dir: Path, run: Run) -> dict:
+    def _probe(
+        self,
+        env: Environment,
+        point_dir: Path,
+        run: Run,
+        on_update: Callable[[], None] | None = None,
+    ) -> dict:
         """Run the copy under the probe and return its outcome."""
         host_dir = point_dir / run.name
         workdir = in_container(host_dir)
@@ -346,6 +382,8 @@ class Driver:
         def poll() -> None:
             """Interrupt the copy once most of its objects are copied."""
             nonlocal interrupted
+            if on_update:
+                on_update()
             if run.kind != "interrupted" or interrupted:
                 return
             progress = _read_json(host_dir / "progress.json")
@@ -357,8 +395,9 @@ class Driver:
                 env.signal_detached(workdir)
                 interrupted = True
 
-        budget = self.options.budget_hours * 3600
-        env.start_detached(command, workdir, variables, timeout=budget)
+        env.start_detached(
+            command, workdir, variables, timeout=self.options.budget_hours * 3600
+        )
         code = env.wait_detached(workdir, poll)
         duration = time.monotonic() - started
         env.chown(workdir)
@@ -369,7 +408,8 @@ class Driver:
             "duration": duration,
             "outcome": (
                 "timeout"
-                if code == 124 or (code == 137 and duration >= budget)
+                if code == 124
+                or (code == 137 and duration >= self.options.budget_hours * 3600)
                 else summary.get("outcome")
             ),
             "interrupted": interrupted,
@@ -460,8 +500,10 @@ def _read_json(path: Path) -> dict | None:
 
 
 def _write_json(path: Path, data: dict) -> None:
-    """Write the JSON file."""
-    path.write_text(json.dumps(data, indent=2) + "\n")
+    """Replace a JSON file atomically so an interrupted write keeps its previous version."""
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, indent=2) + "\n")
+    temporary.replace(path)
 
 
 def _log(message: str) -> None:
