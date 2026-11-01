@@ -120,13 +120,19 @@ test-integration-parallel: check-docker-compose build
 
 .PHONY: test-benchmark-copy-memory
 test-benchmark-copy-memory: check-docker-compose build
-	uv run python -m tests.benchmark.copy_memory run \
+	uv run --group benchmark python -m tests.benchmark.copy_memory run \
 	    --parts $(BENCH_PARTS) \
 	    --versions $(CLICKHOUSE_VERSIONS) \
 	    --columns $(BENCH_COLUMNS) \
 	    --workers $(BENCH_WORKERS) \
 	    $(if $(BASELINE_REF),--baseline-ref $(BASELINE_REF)) \
 	    $(BENCH_ARGS)
+
+.PHONY: test-benchmark-copy-memory-overnight
+test-benchmark-copy-memory-overnight: BENCH_PARTS = 10000,20000,30000
+test-benchmark-copy-memory-overnight: CLICKHOUSE_VERSIONS = 26.3.12.3
+test-benchmark-copy-memory-overnight: override BENCH_ARGS += --overnight
+test-benchmark-copy-memory-overnight: test-benchmark-copy-memory
 
 
 .PHONY: clean
@@ -245,6 +251,7 @@ help:
 	@echo "  test-integration           Run integration tests."
 	@echo "  test-integration-parallel  Run whole features in isolated parallel environments."
 	@echo "  test-benchmark-copy-memory Measure memory of copying data of object storage disks."
+	@echo "  test-benchmark-copy-memory-overnight  Bounded nightly measurements and profiler controls."
 	@echo "  isort                      Perform isort checks."
 	@echo "  black                      Perform black checks."
 	@echo "  codespell                  Perform codespell checks."

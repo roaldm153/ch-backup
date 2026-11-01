@@ -17,6 +17,8 @@ from typing import Iterator
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
+from tests.benchmark.copy_memory import measurements, profiles
+
 TARGET_PARTS = 120_000
 GIB = 1024**3
 MIB = 1024**2
@@ -37,7 +39,7 @@ PEAK_SERIES = (
     ("total", "fresh", "сумма пиков, свежий copy"),
 )
 
-FRESH_RUNS = ("fresh", "fresh_planning")
+FRESH_RUNS = ("fresh", "fresh_planning", "fresh_metadata")
 RESUME_RUNS = ("resume",)
 
 
@@ -67,6 +69,8 @@ def _load_run(run: dict, run_dir: Path) -> None:
     except (FileNotFoundError, json.JSONDecodeError):
         run["summary"] = {}
     run["sample_stats"] = sample_stats(run_dir / "samples.csv")
+    if run.get("profile") and (run_dir / "rc").exists():
+        run.update(profiles.coverage(run_dir, run["profile"]))
     run["duration"] = max(run.get("duration", 0), run["sample_stats"].get("t", 0))
     if run.get("exit_code") is None:
         try:
@@ -94,6 +98,10 @@ def sample_stats(path: Path) -> dict:
             result[f"peak_{name}"] = max(result.get(f"peak_{name}", 0), value)
         result["t"] = float(row["t"])
         result["stage"] = row["stage"]
+        result["peak_total_rss"] = max(
+            result.get("peak_total_rss", 0),
+            int(row["main_rss"]) + int(row["workers_rss"]),
+        )
     return result
 
 
@@ -159,7 +167,7 @@ def fit(xs: list[float], ys: list[float]) -> tuple[float, float] | None:
 
 
 def series_points(
-    points: list[dict], version: str, measure: str, kind: str
+    points: list[dict], version: str, measure: str, kind: str, mode: str = "full"
 ) -> list[tuple[float, float, float]]:
     """Return objects, peak and objects at 120k parts of candidate runs of the version."""
     names = FRESH_RUNS if kind == "fresh" else RESUME_RUNS
@@ -173,6 +181,7 @@ def series_points(
                 and run["kind"] in names
                 and run["stages"]
                 and run["exit_code"] == 0
+                and run.get("mode", "full") == mode
             ):
                 result.append(
                     (
@@ -213,12 +222,14 @@ def _save_figure(fig: Figure, out: Path) -> None:
     temporary.replace(out)
 
 
-def _plot_version_peaks(ax: Axes, points: list[dict], version: str) -> None:
+def _plot_version_peaks(
+    ax: Axes, points: list[dict], version: str, mode: str = "full"
+) -> None:
     """Plot peak series of one version with their fits."""
     forecasts: list[float] = []
     ends: list[float] = []
     for color, (measure, kind, label) in zip(SERIES, PEAK_SERIES):
-        data = series_points(points, version, measure, kind)
+        data = series_points(points, version, measure, kind, mode)
         if not data:
             continue
         xs = [x / 1e6 for x, _, _ in data]
@@ -248,7 +259,7 @@ def _plot_version_peaks(ax: Axes, points: list[dict], version: str) -> None:
             forecasts.append(line[0] * end + line[1])
             ends.append(end)
     _label_ends(ax, ends, forecasts)
-    ax.set_title(f"ClickHouse {version}", color=INK, loc="left", fontsize=11)
+    ax.set_title(f"ClickHouse {version}, {mode}", color=INK, loc="left", fontsize=11)
     ax.set_xlabel("объектов в плане, млн", color=INK_SECONDARY)
     ax.set_ylabel("пик RSS, ГиБ", color=INK_SECONDARY)
     ax.set_ylim(bottom=0)
@@ -257,10 +268,19 @@ def _plot_version_peaks(ax: Axes, points: list[dict], version: str) -> None:
 
 def plot_peaks(points: list[dict], out: Path) -> None:
     """Plot peaks against planned objects with fits extrapolated to 120k parts."""
-    versions = sorted({p["version"] for p in points})
-    fig, axes = _figure(len(versions))
-    for ax, version in zip(axes, versions):
-        _plot_version_peaks(ax, points, version)
+    panels = sorted(
+        {
+            (p["version"], r.get("mode", "full"))
+            for p in points
+            for r in p["runs"]
+            if r["kind"] in FRESH_RUNS
+        }
+    )
+    if not panels:
+        panels = [(p["version"], "full") for p in points] or [("—", "full")]
+    fig, axes = _figure(len(panels))
+    for ax, (version, mode) in zip(axes, panels):
+        _plot_version_peaks(ax, points, version, mode)
     handles, labels = axes[0].get_legend_handles_labels()
     if handles:
         fig.legend(
@@ -348,7 +368,7 @@ def plot_timeline(point: dict, run: dict, out: Path) -> None:
     ):
         ax.plot(
             ts,
-            [int(row[column]) / GIB for row in samples],
+            [float(row.get(column) or "nan") / GIB for row in samples],
             color=color,
             linewidth=2,
             label=label,
@@ -434,7 +454,7 @@ def plot_structures(points: list[dict], out: Path) -> list[tuple[dict, str, list
 
 
 def bytes_per_object(
-    points: list[dict], version: str
+    points: list[dict], version: str, mode: str = "full"
 ) -> dict[str, tuple[float, float]]:
     """Return slope in bytes per object and forecast at 120k parts of stage peaks of fresh runs."""
     by_stage: dict[str, list[tuple[float, float, float]]] = defaultdict(list)
@@ -446,6 +466,7 @@ def bytes_per_object(
                 run["variant"] != "candidate"
                 or run["kind"] not in FRESH_RUNS
                 or run["exit_code"] != 0
+                or run.get("mode", "full") != mode
             ):
                 continue
             for stage, row in stage_table(run["stages"]).items():
@@ -598,13 +619,21 @@ def _forecast_lines(points: list[dict]) -> list[str]:
     """Return tables of bytes per object and the forecast by stage."""
     lines: list[str] = []
     lines += ["", f"## Прогноз на {TARGET_PARTS} партов", ""]
-    for version in sorted({p["version"] for p in points}):
-        model = bytes_per_object(points, version)
+    panels = sorted(
+        {
+            (p["version"], r.get("mode", "full"))
+            for p in points
+            for r in p["runs"]
+            if r["kind"] in FRESH_RUNS
+        }
+    )
+    for version, mode in panels:
+        model = bytes_per_object(points, version, mode)
         if not model:
             lines.append(f"{version}: для подгонки нужно хотя бы две точки.")
             continue
         lines += [
-            f"ClickHouse {version}, пик основного процесса по этапам свежего copy:",
+            f"ClickHouse {version}, {mode}, пик основного процесса по этапам свежего copy:",
             "",
             "| Этап | Байт на объект | Прогноз, ГиБ |",
             "|---|---|---|",
@@ -640,6 +669,10 @@ def render_markdown(points: list[dict], structures: list) -> str:
     lines += _inventory_lines(points)
     lines += _run_lines(points)
     lines += _sample_lines(points)
+    lines += measurements.overhead_lines(points)
+    lines += measurements.profile_lines(points)
+    lines += measurements.s3_lines(points)
+    lines += measurements.resource_lines(points)
     for point in points:
         for run in point["runs"]:
             if run.get("sample_stats"):
@@ -656,6 +689,8 @@ def render_markdown(points: list[dict], structures: list) -> str:
         "это верхняя оценка: пики могли прийтись на разное время.",
         "Незавершённые прогоны содержат только успевшие записаться замеры "
         "и не участвуют в экстраполяции; прочерк означает отсутствие замеров.",
+        "Full, planning_only и metadata_only имеют отдельные прогнозы. Metadata-only resume "
+        "не воспроизводит большой журнал и target listing. Профилированные контроли исключены из прогноза.",
         "",
         "![Пики от числа объектов](peak_vs_objects.png)",
         "",
@@ -673,6 +708,14 @@ def build(root: Path) -> None:
     plot_peaks(points, root / "peak_vs_objects.png")
     plot_stage_peaks(points, root / "stage_peaks.png")
     for point in points:
+        directory = root / point["version"] / str(point["parts"])
+        series, point["resource_totals"] = measurements.process_series(
+            directory / "telemetry/processes.jsonl"
+        )
+        if series:
+            plot_resources(
+                series, root / f"resources_{point['version']}_{point['parts']}.png"
+            )
         for run in point["runs"]:
             plot_timeline(
                 point,
@@ -682,8 +725,53 @@ def build(root: Path) -> None:
             )
     structures = plot_structures(points, root / "structures.png")
     temporary = root / "report.tmp.md"
-    temporary.write_text(render_markdown(points, structures))
+    text = render_markdown(points, structures)
+    if (root / "series.json").exists():
+        status = json.loads((root / "series.json").read_text())["status"]
+        text = text.replace(
+            "# Память ch-backup copy\n",
+            f"# Память ch-backup copy\n\nСостояние серии: {status}.\n",
+            1,
+        )
+    temporary.write_text(text)
     temporary.replace(root / "report.md")
+
+
+def plot_resources(series: list[dict], out: Path) -> None:
+    """Plot bounded host observations, separating application and infrastructure roles."""
+    fig = Figure(figsize=(11, 9), facecolor=SURFACE)
+    axes = fig.subplots(3, 1, sharex=True)
+    roles = ("main", "worker", "clickhouse", "seaweedfs", "observer")
+    colors = (*SERIES, INK_MUTED)
+    times = [(row["at"] - series[0]["at"]) / 60 for row in series]
+    for ax, metric, scale, label in zip(
+        axes,
+        ("rss", "cpu", "io"),
+        (GIB, 1, MIB),
+        ("Сумма RSS, ГиБ", "CPU, занятых ядер", "Дисковый I/O, МиБ/с"),
+    ):
+        _style(ax)
+        values = [
+            [
+                (
+                    float("nan")
+                    if metric == "io" and row["roles"].get(role, {}).get("io_missing")
+                    else row["roles"].get(role, {}).get(metric, 0) / scale
+                )
+                for row in series
+            ]
+            for role in roles
+        ]
+        if metric == "rss":
+            ax.stackplot(times, *values, labels=roles, colors=colors, alpha=0.8)
+        else:
+            for role, color, data in zip(roles, colors, values):
+                ax.plot(times, data, color=color, label=role, linewidth=1)
+        ax.set_ylabel(label)
+    axes[0].legend(loc="upper left", ncol=3, fontsize=8)
+    axes[-1].set_xlabel("Минуты от начала наблюдения")
+    fig.tight_layout()
+    _save_figure(fig, out)
 
 
 def _bars_height(bars: int) -> float:
@@ -759,7 +847,7 @@ def _samples(path: Path) -> Iterator[dict]:
         for row in csv.DictReader(line for line in f if line.endswith("\n")):
             try:
                 float(row["t"])
-                for name in ("main_rss", "workers_rss", "workers_uss"):
+                for name in ("main_rss", "workers_rss"):
                     int(row[name])
             except (KeyError, TypeError, ValueError):
                 continue

@@ -164,6 +164,8 @@ def test_point_checkpoints_and_logs(tmp_path: Path, timeout: bool) -> None:
     }
     with (
         patch.object(benchmark, "_configure"),
+        patch.object(benchmark, "_start_collector"),
+        patch.object(benchmark, "_save_environment"),
         patch.object(benchmark, "_backup", return_value=10),
         patch.object(benchmark, "_probe", return_value=result) as run,
         patch.object(driver.dataset, "create_table"),

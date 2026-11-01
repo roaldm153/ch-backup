@@ -11,9 +11,13 @@ Every copy has a wall-clock limit, including the first. Reports are refreshed af
 the backup and after each copy. Logs are saved before removing containers on success or failure.
 """
 
+import hashlib
 import json
+import os
+import shlex
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -21,7 +25,8 @@ from typing import Callable
 
 import yaml
 
-from tests.benchmark.copy_memory import dataset, inventory, report
+from tests.benchmark.copy_memory import dataset, inventory, profiles, report
+from tests.benchmark.copy_memory.budget import Budget, BudgetExpired
 from tests.benchmark.copy_memory.env import TARGET_BUCKET, Environment
 from tests.integration.modules.utils import merge
 
@@ -29,6 +34,7 @@ BACKUP_NAME = "bench"
 CONFIG_PATH = "/tmp/bench/ch-backup.conf"
 ORIGINAL_CONFIG_PATH = "/etc/yandex/ch-backup/ch-backup.conf"
 PROBE = "/code/tests/benchmark/copy_memory/probe.py"
+TOOLS_PYTHON = "/tmp/bench-tools/bin/python"
 BASELINE_DIR = Path("staging/baseline")
 SESSIONS_DIR = Path("staging/benchmark/sessions")
 TARGET_CLOUD_BUCKET = "cloud-storage-02"
@@ -47,6 +53,8 @@ CLICKHOUSE_LOG_CONFIG = """<clickhouse>
 class Options:
     """Parameters of the benchmark."""
 
+    # pylint: disable=too-many-instance-attributes
+
     parts: list[int]
     versions: list[str]
     columns: int = 120
@@ -56,6 +64,18 @@ class Options:
     freeze_timeout: int = 21600
     planning_only_from: int | None = None
     interval: float = 0.5
+    overnight: bool = False
+    total_budget_hours: float | None = None
+    profiles: bool = False
+    profile_parts: int = 50
+    profile_repeats: int = 3
+    cpu_window: int = 120
+    cpu_windows: int = 3
+    native_profiles: bool = False
+    trace_python_allocators: bool = False
+    tracemalloc: bool = False
+    min_free_gib: float = 20
+    max_profile_gib: float = 4
     results: Path = field(
         default_factory=lambda: Path("staging/benchmark")
         / time.strftime("%Y%m%dT%H%M%S")
@@ -70,6 +90,7 @@ class Run:
     mode: str
     prefix: str
     variant: str = "candidate"
+    profile: str | None = None
 
     @property
     def name(self) -> str:
@@ -113,7 +134,9 @@ def in_container(path: Path) -> str:
     return f"/code/{relative}"
 
 
-def plan_runs(smallest: bool, full: bool, metadata_v5: bool, objects: int) -> list[Run]:
+def plan_runs(
+    smallest: bool, full: bool, metadata_v5: bool, objects: int, trace: bool = False
+) -> list[Run]:
     """Return copies of the point in the order they are run."""
     runs = []
     if full:
@@ -130,7 +153,7 @@ def plan_runs(smallest: bool, full: bool, metadata_v5: bool, objects: int) -> li
                 Run("fresh_metadata", "metadata_only", "metadata"),
                 Run("resume", "metadata_only", "metadata"),
             ]
-    if objects >= TRACEMALLOC_OBJECTS:
+    if trace and objects >= TRACEMALLOC_OBJECTS:
         runs.append(Run("tracemalloc", "planning_only", "tracemalloc"))
     return runs
 
@@ -139,10 +162,13 @@ class Driver:
     """Runs points of the benchmark and saves their results."""
 
     def __init__(self, options: Options) -> None:
+        """Keep the run budget and collector separate from measured processes."""
         self.options = options
         self.results = options.results
         self.speed: float | None = None
         self.full_copy_timed_out = False
+        self.budget = Budget(options.total_budget_hours)
+        self.collector: subprocess.Popen | None = None
 
     def run(self) -> None:
         """Run all versions and points."""
@@ -156,6 +182,29 @@ class Driver:
         (self.results / "config-overrides.yaml").write_text(
             yaml.safe_dump(overrides(self.options.workers))
         )
+        status = {"status": "running", "started": time.time()}
+        _write_json(self.results / "series.json", status)
+        try:
+            self._versions()
+            failed = any(
+                (_read_json(path) or {}).get("status") != "completed"
+                for path in self.results.glob("*/*/point.json")
+            )
+            status["status"] = "completed_with_errors" if failed else "completed"
+        except BudgetExpired as error:
+            status.update(status="budget_exhausted", error=str(error))
+            self._skip_remaining()
+        except BaseException as error:
+            status.update(status="failed", error=f"{type(error).__name__}: {error}")
+            raise
+        finally:
+            status["ended"] = time.time()
+            _write_json(self.results / "series.json", status)
+            report.build(self.results)
+        _log(f"Results: {self.results}")
+
+    def _versions(self) -> None:
+        """Build each version and run its points under the shared deadline."""
         for version in self.options.versions:
             slug = version.replace(".", "-")
             env = Environment(
@@ -164,77 +213,153 @@ class Driver:
                 SESSIONS_DIR / f"{self.results.name}-{slug}.sav",
             )
             _log(f"ClickHouse {version}: building images")
-            env.create()
+            with self.budget.watch():
+                env.create()
             self.speed = None
             self.full_copy_timed_out = False
-            for parts in sorted(self.options.parts):
+            for parts in self._parts():
+                self.budget.remaining()
+                if (
+                    shutil.disk_usage(self.results).free
+                    < self.options.min_free_gib * 1024**3
+                ):
+                    raise RuntimeError("Insufficient free disk space for another point")
                 self._point(env, version, parts)
-        _log(f"Results: {self.results}")
+
+    def _parts(self) -> list[int]:
+        """Include a small calibration point only when profiling was requested."""
+        extra = [self.options.profile_parts] if self.options.profiles else []
+        return sorted(set(self.options.parts + extra))
+
+    def _skip_remaining(self) -> None:
+        """Make unstarted points visible after the series budget is exhausted."""
+        for version in self.options.versions:
+            for parts in self._parts():
+                directory = self.results / version / str(parts)
+                if not (directory / "point.json").exists():
+                    directory.mkdir(parents=True, exist_ok=True)
+                    _write_json(
+                        directory / "point.json",
+                        {
+                            "version": version,
+                            "parts": parts,
+                            "runs": [],
+                            "status": "skipped_budget",
+                        },
+                    )
 
     def _point(self, env: Environment, version: str, parts: int) -> None:
         """Measure one number of parts, saving what was done even if the point fails."""
         point_dir = self.results / version / str(parts)
         point_dir.mkdir(parents=True)
         point: dict = {"version": version, "parts": parts, "timings": {}, "runs": []}
-        timings = point["timings"]
         _log(f"ClickHouse {version}, {parts} parts")
         started = time.monotonic()
         try:
-            env.start()
-            timings["start"] = time.monotonic() - started
-            self._configure(env)
-            dataset.create_table(env, self.options.columns, parts)
-            timings["insert"] = dataset.insert_parts(env, self.options.columns, parts)
-            dataset.check_parts(env, parts)
-            timings["backup"] = self._backup(env, point_dir)
-            point["status"] = "backup_completed"
-            self._checkpoint(point_dir, point)
-            started = time.monotonic()
-            inv = inventory.collect(env, parts, BACKUP_NAME, CONFIG_PATH)
-            timings["inventory"] = time.monotonic() - started
-            _write_json(point_dir / "inventory.json", inv)
-            point["status"] = "copying"
-            self._checkpoint(point_dir, point)
-            objects = inv["unique_objects"]
-            full = self._fits(parts, objects)
-            point["mode"] = "full" if full else "planning_only"
-            for run in plan_runs(
-                parts == min(self.options.parts),
-                full,
-                inv["metadata_format_version"] >= 5,
-                objects,
-            ):
-                variants = ["candidate"]
-                if self.options.baseline_ref:
-                    variants.append("baseline")
-                for variant in variants:
-                    run.variant = variant
-                    result = self._run(env, point_dir, point, run)
-                    if result["outcome"] == "timeout":
-                        self.full_copy_timed_out |= run.mode == "full"
-                        point["status"] = "timeout"
-                        point["error"] = (
-                            f"{run.name} exceeded {self.options.budget_hours} hours"
-                        )
-                        return
-                    if result["exit_code"] and not (
-                        run.kind == "interrupted" and result["interrupted"]
-                    ):
-                        raise RuntimeError(
-                            f"{run.name} exited with {result['exit_code']}"
-                        )
-            point["status"] = "completed"
-        except (Exception, KeyboardInterrupt) as e:
+            with self.budget.watch():
+                self._measure_point(env, point_dir, point, parts, started)
+        except BudgetExpired as error:
+            point.update(status="budget_exhausted", error=str(error))
+            raise
+        except (Exception, KeyboardInterrupt) as error:
             point["status"] = "failed"
-            point["error"] = f"{type(e).__name__}: {e}"
+            point["error"] = f"{type(error).__name__}: {error}"
             _log(f"Point failed: {point['error']}")
-            if isinstance(e, KeyboardInterrupt):
+            if isinstance(error, KeyboardInterrupt):
                 raise
         finally:
             self._finish_point(env, point_dir, point)
 
+    def _measure_point(
+        self, env: Environment, point_dir: Path, point: dict, parts: int, started: float
+    ) -> None:
+        """Prepare a source once and reuse it for comparable copy runs."""
+        timings = point["timings"]
+        env.start()
+        timings["start"] = time.monotonic() - started
+        self._configure(env)
+        self._save_environment(env, point_dir)
+        self._start_collector(env, point_dir)
+        dataset.create_table(env, self.options.columns, parts)
+        timings["insert"] = dataset.insert_parts(env, self.options.columns, parts)
+        dataset.check_parts(env, parts)
+        timings["backup"] = self._backup(env, point_dir)
+        point["status"] = "backup_completed"
+        self._checkpoint(point_dir, point)
+        started = time.monotonic()
+        inv = inventory.collect(env, parts, BACKUP_NAME, CONFIG_PATH)
+        timings["inventory"] = time.monotonic() - started
+        _write_json(point_dir / "inventory.json", inv)
+        point["status"] = "copying"
+        self._checkpoint(point_dir, point)
+        objects = inv["unique_objects"]
+        full = self._fits(parts, objects)
+        point["mode"] = "full" if full else "planning_only"
+        for run in self._runs(parts, full, inv):
+            variants = ["candidate"]
+            if self.options.baseline_ref:
+                variants.append("baseline")
+            for variant in variants:
+                run.variant = variant
+                result = self._run(env, point_dir, point, run)
+                if result.get("resource_limit"):
+                    raise RuntimeError(result["resource_limit"])
+                if result["outcome"] == "timeout":
+                    self.budget.remaining()
+                    self.full_copy_timed_out |= run.mode == "full"
+                    point["status"] = "timeout"
+                    point["error"] = (
+                        f"{run.name} exceeded {self.options.budget_hours} hours"
+                    )
+                    return
+                if result["exit_code"] and not (
+                    run.kind == "interrupted" and result["interrupted"]
+                ):
+                    raise RuntimeError(f"{run.name} exited with {result['exit_code']}")
+        point["status"] = (
+            "profile_incomplete"
+            if any(
+                result.get("profile_status") == "incomplete" for result in point["runs"]
+            )
+            else "completed"
+        )
+
+    def _runs(self, parts: int, full: bool, inventory_data: dict) -> list[Run]:
+        """Alternate profiler order on the same small source backup."""
+        if self.options.profiles and parts == self.options.profile_parts:
+            runs = []
+            modes = (None, "cpu", "memory")
+            for repeat in range(self.options.profile_repeats):
+                for mode in modes[repeat % 3 :] + modes[: repeat % 3]:
+                    name = f"control_{mode or 'plain'}_{repeat + 1}"
+                    runs.append(Run(name, "full", name, profile=mode))
+            return runs
+        return plan_runs(
+            parts == min(self.options.parts) and not self.options.overnight,
+            full,
+            inventory_data["metadata_format_version"] >= 5,
+            inventory_data["unique_objects"],
+            self.options.tracemalloc,
+        )
+
     def _finish_point(self, env: Environment, point_dir: Path, point: dict) -> None:
         """Save logs and the report before cleaning up any completed or failed point."""
+        for directory in point_dir.iterdir():
+            if (
+                directory.is_dir()
+                and (directory / "pid").exists()
+                and not (directory / "rc").exists()
+            ):
+                try:
+                    env.signal_detached(in_container(directory))
+                    deadline = time.monotonic() + 65
+                    while (
+                        not (directory / "rc").exists() and time.monotonic() < deadline
+                    ):
+                        time.sleep(1)
+                except Exception as error:
+                    point["termination_error"] = str(error)
+        self._stop_collector(point_dir)
         try:
             env.save_diagnostics(point_dir / "diagnostics")
         except Exception as e:
@@ -244,6 +369,81 @@ class Driver:
             self._checkpoint(point_dir, point)
         finally:
             env.stop()
+
+    def _start_collector(self, env: Environment, point_dir: Path) -> None:
+        """Launch host observation before source backup preparation."""
+        directory = point_dir / "telemetry"
+        directory.mkdir()
+        command = [
+            sys.executable,
+            "-m",
+            "tests.benchmark.copy_memory.collector",
+            "--point",
+            str(point_dir.resolve()),
+            "--container",
+            env.container(),
+            "--storage",
+            env.container("seaweedfs01"),
+            "--driver-pid",
+            str(os.getpid()),
+            "--interval",
+            str(max(1, self.options.interval)),
+            "--cpu-window",
+            str(self.options.cpu_window),
+            "--cpu-windows",
+            str(self.options.cpu_windows),
+            "--min-free-gib",
+            str(self.options.min_free_gib),
+            "--max-profile-gib",
+            str(self.options.max_profile_gib),
+        ]
+        if self.options.native_profiles:
+            command.append("--native")
+        with (directory / "collector.log").open("w", encoding="utf-8") as output:
+            self.collector = subprocess.Popen(  # pylint: disable=consider-using-with
+                command, stdout=output, stderr=subprocess.STDOUT
+            )
+
+    def _save_environment(self, env: Environment, point_dir: Path) -> None:
+        """Record versions and source hashes without serializing credentials or configuration."""
+        script = (
+            "import importlib.metadata as m, json, platform, sys; "
+            "from ch_backup.config import Config; "
+            f"config = Config({CONFIG_PATH!r}); "
+            "print(json.dumps({'python': sys.version, 'platform': platform.platform(), "
+            "'settings': {section: config[section] for section in "
+            "('filesystem', 'compression', 'multiprocessing')}, "
+            "'packages': {d.metadata['Name']: d.version for d in m.distributions()}}))"
+        )
+        data = json.loads(env.exec(shlex.join([TOOLS_PYTHON, "-c", script])))
+        digest = hashlib.sha256()
+        for path in sorted(
+            [*Path("ch_backup").rglob("*.py"), *Path("tests/benchmark").rglob("*.py")]
+        ):
+            digest.update(str(path).encode())
+            digest.update(path.read_bytes())
+        data["source_sha256"] = digest.hexdigest()
+        data["images"] = {}
+        for name in ("clickhouse01", "seaweedfs01"):
+            data["images"][name] = subprocess.run(
+                ["docker", "inspect", "--format", "{{.Image}}", env.container(name)],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+            ).stdout.strip()
+        _write_json(point_dir / "environment.json", data)
+
+    def _stop_collector(self, point_dir: Path) -> None:
+        """Finalize CPU windows before removing the benchmark containers."""
+        if self.collector:
+            (point_dir / "telemetry/stop").touch()
+            try:
+                self.collector.wait(timeout=40)
+            except subprocess.TimeoutExpired:
+                self.collector.kill()
+                self.collector.wait(timeout=5)
+            self.collector = None
 
     def _checkpoint(self, point_dir: Path, point: dict) -> None:
         """Save the point and refresh the report without losing results if plotting fails."""
@@ -287,7 +487,7 @@ class Driver:
 
     def _fits(self, parts: int, objects: int) -> bool:
         """Check that full copies of the point fit into the time budget."""
-        if self.full_copy_timed_out:
+        if self.options.overnight or self.full_copy_timed_out:
             return False
         if self.options.planning_only_from and parts >= self.options.planning_only_from:
             return False
@@ -307,6 +507,11 @@ class Driver:
         env.put_file(CONFIG_PATH, yaml.safe_dump(config))
         env.put_file("/etc/clickhouse-server/conf.d/bench.xml", CLICKHOUSE_LOG_CONFIG)
         env.restart_clickhouse()
+        env.exec(
+            "python3 -m venv --system-site-packages /tmp/bench-tools && "
+            "/tmp/bench-tools/bin/pip install --disable-pip-version-check "
+            "-r /code/tests/benchmark/copy_memory/requirements.txt"
+        )
 
     def _backup(self, env: Environment, point_dir: Path) -> float:
         """Back up the table with the config of integration tests and return the duration."""
@@ -327,12 +532,27 @@ class Driver:
                 dataset.DATABASE,
             ],
             workdir,
+            timeout=self.budget.limit(self.options.budget_hours * 3600),
         )
-        code = env.wait_detached(workdir)
+        code = env.wait_detached(workdir, lambda: self._health(env, point_dir, workdir))
         env.chown(workdir)
         if code:
             raise RuntimeError(f"Backup exited with {code}, see {point_dir}/backup")
         return time.monotonic() - started
+
+    def _health(self, env: Environment, point_dir: Path, workdir: str) -> None:
+        """Stop work if observation or the available disk budget has been lost."""
+        self.budget.remaining()
+        limit = _read_json(point_dir / "telemetry/limit.json")
+        heartbeat = point_dir / "telemetry/heartbeat"
+        stale = heartbeat.exists() and time.time() - heartbeat.stat().st_mtime > 60
+        if limit or (self.collector and (self.collector.poll() is not None or stale)):
+            env.signal_detached(workdir)
+            raise RuntimeError(
+                limit["reason"]
+                if limit
+                else "External collector stopped or stalled; see telemetry/collector.log"
+            )
 
     def _probe(
         self,
@@ -342,17 +562,33 @@ class Driver:
         on_update: Callable[[], None] | None = None,
     ) -> dict:
         """Run the copy under the probe and return its outcome."""
+        # pylint: disable=too-many-locals
         host_dir = point_dir / run.name
         workdir = in_container(host_dir)
         if run.kind == "resume":
             env.reset_copy_state(run.path_root, BACKUP_NAME)
-        command = ["python3", PROBE, "--out", workdir]
+        command = [TOOLS_PYTHON, PROBE, "--out", workdir]
+        if self.collector:
+            command.append("--wait-collector")
+            _write_json(
+                point_dir / "telemetry/current.json",
+                {"run": run.name, "profile": run.profile},
+            )
         command += ["--interval", str(self.options.interval)]
         if run.mode != "full":
             command.append(f"--{run.mode.replace('_', '-')}")
         if run.kind == "tracemalloc":
             command.append("--tracemalloc")
-        variables = {}
+        variables = {
+            "CH_BACKUP_BENCH_INSTRUMENTATION": json.dumps(
+                {
+                    "out": workdir,
+                    "memory": run.profile == "memory",
+                    "native": self.options.native_profiles,
+                    "python_allocators": self.options.trace_python_allocators,
+                }
+            )
+        }
         if run.variant == "baseline":
             command.append("--allow-missing")
             variables["PYTHONPATH"] = f"/code/{BASELINE_DIR}"
@@ -384,6 +620,7 @@ class Driver:
             nonlocal interrupted
             if on_update:
                 on_update()
+            self._health(env, point_dir, workdir)
             if run.kind != "interrupted" or interrupted:
                 return
             progress = _read_json(host_dir / "progress.json")
@@ -395,9 +632,8 @@ class Driver:
                 env.signal_detached(workdir)
                 interrupted = True
 
-        env.start_detached(
-            command, workdir, variables, timeout=self.options.budget_hours * 3600
-        )
+        timeout = self.budget.limit(self.options.budget_hours * 3600)
+        env.start_detached(command, workdir, variables, timeout=timeout)
         code = env.wait_detached(workdir, poll)
         duration = time.monotonic() - started
         env.chown(workdir)
@@ -408,13 +644,16 @@ class Driver:
             "duration": duration,
             "outcome": (
                 "timeout"
-                if code == 124
-                or (code == 137 and duration >= self.options.budget_hours * 3600)
+                if code == 124 or (code == 137 and duration >= timeout)
                 else summary.get("outcome")
             ),
             "interrupted": interrupted,
             "oom_events": _oom_events(wall_start),
         }
+        result.update(self._profile_result(env, host_dir, workdir, run))
+        limit = _read_json(point_dir / "telemetry/limit.json")
+        if limit and "reason" in limit:
+            result["resource_limit"] = limit["reason"]
         counters = summary.get("counters", {})
         if (
             run.kind == "fresh"
@@ -427,10 +666,35 @@ class Driver:
         _log(f"    exit code {code}, {duration:.0f} s, {summary.get('outcome')}")
         return result
 
+    def _profile_result(
+        self, env: Environment, host_dir: Path, workdir: str, run: Run
+    ) -> dict:
+        """Render and validate optional profiles outside the measured copy duration."""
+        if run.profile == "memory":
+            env.exec(
+                shlex.join(
+                    [
+                        TOOLS_PYTHON,
+                        "/code/tests/benchmark/copy_memory/profiles.py",
+                        workdir,
+                    ]
+                )
+            )
+        if run.profile:
+            deadline = time.monotonic() + 30
+            while (host_dir / "cpu-active").exists() and time.monotonic() < deadline:
+                time.sleep(0.2)
+            return profiles.coverage(host_dir, run.profile)
+        return {}
+
     def _save_system(self) -> None:
         """Save the hardware, disks and code the benchmark runs on."""
         commands = (
             ["git", "rev-parse", "HEAD"],
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            ["uname", "-a"],
+            ["lscpu"],
+            ["py-spy", "--version"],
             ["nproc"],
             ["free", "-g"],
             ["swapon", "--show"],

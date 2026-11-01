@@ -4,14 +4,13 @@ Run ch-backup with memory probes on stages of copying.
 The probe wraps methods of the copier, so production code stays unchanged. A stage ends with
 peaks of the main and worker processes taken from VmHWM, which is reset when the stage starts.
 Stages form a stack: a nested stage pauses the outer one, so their segments do not overlap.
-A sampler thread writes memory of the processes to samples.csv. Spawned workers import this
-file as __mp_main__, so only definitions are at the top level.
+An independent host collector writes memory samples. Spawned workers import this file as
+__mp_main__, which enables the same optional instrumentation in every worker.
 """
 
 # pylint: disable=protected-access
 
 import argparse
-import csv
 import importlib
 import json
 import os
@@ -155,7 +154,7 @@ class Probe:
         self.segment_rss = 0
         self.segment_cpu: dict[int, float] = {}
         self.stopped = threading.Event()
-        self.sampler = threading.Thread(target=self._sample_loop, daemon=True)
+        self.sampler = threading.Thread(target=self._progress_loop, daemon=True)
 
     def install(self, planning_only: bool, metadata_only: bool) -> None:
         """Wrap stage methods and hooks, with switches of the run mode."""
@@ -164,10 +163,16 @@ class Probe:
         self._patch(CONTEXT, "CopyContext", "flush", self._flush_counter)
         self._patch(COPIER, "BackupCopier", "_transfer_backup", self._result_catcher)
         if metadata_only:
-            self._patch(COPIER, "BackupCopier", "_copy_objects", _without_objects)
+            self._patch(
+                COPIER, "BackupCopier", "_copy_objects", _without_objects, required=True
+            )
         if planning_only:
             self._patch(
-                COPIER, "BackupCopier", "_upload_target_metadata", _stop_planned
+                COPIER,
+                "BackupCopier",
+                "_upload_target_metadata",
+                _stop_planned,
+                required=True,
             )
         for module, owner, name, stage in STAGES:
             self._patch(module, owner, name, self._stage_wrapper(stage))
@@ -177,6 +182,17 @@ class Probe:
         if self.trace:
             tracemalloc.start(25)
         self._open_segment()
+        (self.out / "probe.json").write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "created": psutil.Process().create_time(),
+                    "started": self.started,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._save_progress()
         self.sampler.start()
 
     def finish(self, code: int, outcome: str, error: str | None) -> None:
@@ -212,7 +228,12 @@ class Probe:
             self._open_segment()
 
     def _patch(
-        self, module: str, owner_name: str, name: str, make: Callable[[Any], Any]
+        self,
+        module: str,
+        owner_name: str,
+        name: str,
+        make: Callable[[Any], Any],
+        required: bool = False,
     ) -> None:
         """Replace the method with a wrapper, failing on a missing one unless allowed."""
         try:
@@ -222,7 +243,7 @@ class Probe:
         original = vars(owner).get(name) if owner is not None else None
         if original is None:
             target = f"{module}.{owner_name}.{name}"
-            if self.strict:
+            if self.strict or required:
                 raise RuntimeError(f"Method {target} is not found")
             self.missing.append(target)
             return
@@ -372,7 +393,10 @@ class Probe:
         if self.trace:
             record["traced"], record["traced_peak"] = tracemalloc.get_traced_memory()
             if end - self.segment_start >= 1:
+                started = time.monotonic()
                 self._save_snapshot(self.stack[-1], end - self.started)
+                record["snapshot_seconds"] = time.monotonic() - started
+                record["snapshot_rss_peak"] = read_status(os.getpid())["VmHWM"]
         _append_line(self.out / "stages.jsonl", record)
 
     @staticmethod
@@ -407,43 +431,14 @@ class Probe:
             self.out / "tracemalloc.jsonl", {"stage": stage, "at": at, "top": top}
         )
 
-    def _sample(self) -> list:
-        """Return a row of memory of the main and worker processes."""
-        memory = read_rollup(os.getpid())
-        anon = read_status(os.getpid()).get("RssAnon", 0)
-        workers = []
-        for pid in worker_pids():
+    def _progress_loop(self) -> None:
+        """Publish counters; the independent host collector measures process resources."""
+        while not self.stopped.wait(self.interval):
             try:
-                workers.append(read_rollup(pid))
-            except (FileNotFoundError, ProcessLookupError):
-                continue
-        return [
-            round(time.monotonic() - self.started, 3),
-            self.stack[-1],
-            memory["rss"],
-            anon,
-            memory["uss"],
-            memory["pss"],
-            len(workers),
-            sum(w["rss"] for w in workers),
-            sum(w["uss"] for w in workers),
-            sum(w["pss"] for w in workers),
-            max((w["uss"] for w in workers), default=0),
-        ]
-
-    def _sample_loop(self) -> None:
-        """Write samples and progress until the run finishes, flushing every row."""
-        with open(self.out / "samples.csv", "w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(SAMPLE_FIELDS)
-            while not self.stopped.wait(self.interval):
-                try:
-                    writer.writerow(self._sample())
-                    f.flush()
-                    self._save_progress()
-                except Exception as e:
-                    if len(self.errors) < 10:
-                        self.errors.append(f"sampler: {e}")
+                self._save_progress()
+            except Exception as error:
+                if len(self.errors) < 10:
+                    self.errors.append(f"progress: {error}")
 
     def _save_progress(self) -> None:
         """Save copied and pending objects for the driver."""
@@ -493,6 +488,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--out", required=True, help="Directory for results.")
     parser.add_argument("--interval", type=float, default=0.5)
     parser.add_argument("--tracemalloc", action="store_true")
+    parser.add_argument("--wait-collector", action="store_true")
     parser.add_argument("--planning-only", action="store_true")
     parser.add_argument("--metadata-only", action="store_true")
     parser.add_argument(
@@ -512,12 +508,21 @@ def main() -> None:
     args = _parse_args(sys.argv[1:])
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    instrumentation = _instrument()
     probe = Probe(out, args.interval, args.tracemalloc, strict=not args.allow_missing)
     probe.install(args.planning_only, args.metadata_only)
     cli = importlib.import_module("ch_backup").main
     code, outcome, error = 0, "completed", None
     probe.start()
     try:
+        if args.wait_collector:
+            deadline = time.monotonic() + 60
+            while not (out / "collector-ready").exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "The external collector did not observe this process"
+                    )
+                time.sleep(0.1)
         cli.main(args=args.command, prog_name="ch-backup")
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else int(e.code is not None)
@@ -529,8 +534,20 @@ def main() -> None:
         if code and outcome == "completed":
             outcome = "failed"
         probe.finish(code, outcome, error)
+        if instrumentation:
+            instrumentation.close()
     sys.exit(code)
 
 
-if __name__ == "__main__":
+def _instrument() -> Any:
+    """Load the same instrumentation module in main and spawn workers."""
+    if not os.environ.get("CH_BACKUP_BENCH_INSTRUMENTATION"):
+        return None
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    return importlib.import_module("instrumentation").start()
+
+
+if __name__ == "__mp_main__":
+    _instrument()
+elif __name__ == "__main__":
     main()
