@@ -1,5 +1,6 @@
 """Render Memray captures with its own reporters, including partial captures."""
 
+import argparse
 import json
 import subprocess
 import sys
@@ -88,8 +89,19 @@ def coverage(directory: Path, kind: str) -> dict:
     }
 
 
-def render(directory: Path) -> list[dict]:
-    """Generate peak, temporal and temporary-allocation views without hiding failures."""
+def render(directory: Path, timeout: int = 900) -> list[dict]:
+    """Render missing or failed views, reusing successful reports of unchanged captures."""
+    if timeout <= 0:
+        raise ValueError("Report timeout must be positive")
+    manifest = directory / "profiles.json"
+    previous = {
+        (record["capture"], record["view"]): record
+        for record in (
+            json.loads(manifest.read_text(encoding="utf-8"))
+            if manifest.exists()
+            else []
+        )
+    }
     records = []
     for capture in sorted(directory.glob("memory-*.bin")):
         for view, flags in (
@@ -116,24 +128,35 @@ def render(directory: Path) -> list[dict]:
             if view == "stats":
                 destination = capture.with_name(f"{capture.stem}-stats.txt")
                 command = [sys.executable, "-m", "memray", "stats", str(capture)]
-            record: dict = {
-                "capture": capture.name,
-                "view": view,
-                "output": destination.name,
-            }
-            log = destination if view == "stats" else destination.with_suffix(".log")
-            with log.open("w", encoding="utf-8") as output:
-                try:
-                    result = subprocess.run(
-                        command,
-                        stdout=output,
-                        stderr=subprocess.STDOUT,
-                        timeout=120,
-                        check=False,
-                    )
-                    record["exit_code"] = result.returncode
-                except subprocess.TimeoutExpired:
-                    record["error"] = "report_timeout"
+            cached = previous.get((capture.name, view), {})
+            if (
+                cached.get("exit_code") == 0
+                and destination.is_file()
+                and destination.stat().st_size
+                and destination.stat().st_mtime_ns >= capture.stat().st_mtime_ns
+            ):
+                record = cached
+            else:
+                record = {
+                    "capture": capture.name,
+                    "view": view,
+                    "output": destination.name,
+                }
+                log = (
+                    destination if view == "stats" else destination.with_suffix(".log")
+                )
+                with log.open("w", encoding="utf-8") as output:
+                    try:
+                        result = subprocess.run(
+                            command,
+                            stdout=output,
+                            stderr=subprocess.STDOUT,
+                            timeout=timeout,
+                            check=False,
+                        )
+                        record["exit_code"] = result.returncode
+                    except subprocess.TimeoutExpired:
+                        record["error"] = "report_timeout"
             records.append(record)
             temporary = directory / "profiles.tmp.json"
             temporary.write_text(json.dumps(records, indent=2), encoding="utf-8")
@@ -142,4 +165,10 @@ def render(directory: Path) -> list[dict]:
 
 
 if __name__ == "__main__":
-    render(Path(sys.argv[1]))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("directory", type=Path)
+    parser.add_argument("--timeout", type=int, default=900)
+    arguments = parser.parse_args()
+    if arguments.timeout <= 0:
+        parser.error("--timeout must be positive")
+    render(arguments.directory, arguments.timeout)

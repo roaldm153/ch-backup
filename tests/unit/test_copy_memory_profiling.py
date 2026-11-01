@@ -3,7 +3,9 @@
 import argparse
 import importlib
 import json
+import os
 import signal
+import subprocess
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -133,20 +135,29 @@ def test_budget_expiry_keeps_point_and_cleanup(tmp_path: Path) -> None:
     env.stop.assert_called_once()
 
 
-def test_overnight_controls_and_large_points() -> None:
+@pytest.mark.parametrize("largest", [30000, 120000])
+def test_overnight_controls_and_large_points(largest: int) -> None:
     """Keep heavy profiles on the small point and rotate their order across repeats."""
+    # pylint: disable=protected-access
     with patch("docker.from_env"):
         driver = importlib.import_module("tests.benchmark.copy_memory.driver")
     benchmark = driver.Driver(
         driver.Options(
-            parts=[10000, 20000, 30000],
+            parts=[10000, 20000, largest],
             versions=["26.3"],
             overnight=True,
             profiles=True,
+            profile_parts=2,
         )
     )
     inventory = {"unique_objects": 3_000_000, "metadata_format_version": 5}
-    controls = benchmark._runs(50, False, inventory)  # pylint: disable=protected-access
+    assert benchmark._parts() == [
+        10000,
+        20000,
+        largest,
+        2,
+    ]
+    controls = benchmark._runs(2, False, inventory)
     assert len(controls) == 9
     assert len({run.path_root for run in controls}) == 9
     assert [run.profile for run in controls[:6]] == [
@@ -157,14 +168,15 @@ def test_overnight_controls_and_large_points() -> None:
         "memory",
         None,
     ]
-    assert not benchmark._fits(10000, 3_000_000)  # pylint: disable=protected-access
-    large = benchmark._runs(10000, False, inventory)  # pylint: disable=protected-access
-    assert [run.mode for run in large] == [
-        "planning_only",
-        "metadata_only",
-        "metadata_only",
-    ]
-    assert all(run.kind != "tracemalloc" for run in large)
+    assert not benchmark._fits(10000, 3_000_000)
+    for parts in (10000, 20000, largest):
+        large = benchmark._runs(parts, False, inventory)
+        assert [run.mode for run in large] == [
+            "planning_only",
+            "metadata_only",
+            "metadata_only",
+        ]
+        assert all(run.kind != "tracemalloc" and run.profile is None for run in large)
 
 
 def test_collector_rejects_recycled_pid(tmp_path: Path) -> None:
@@ -234,6 +246,68 @@ def test_memray_render_preserves_capture_after_failure(tmp_path: Path) -> None:
     assert all(record["exit_code"] == 1 for record in records)
     assert capture.read_bytes() == b"partial capture"
     assert len(json.loads((tmp_path / "profiles.json").read_text())) == 4
+
+
+@pytest.mark.parametrize("unusable", ["timeout", "missing", "empty", "outdated"])
+def test_memray_render_retries_only_unusable_views(
+    tmp_path: Path, unusable: str
+) -> None:
+    """Reuse completed views while recovering a failed or lost report from raw data."""
+    capture = tmp_path / "memory-10.bin"
+    capture.write_bytes(b"saved capture")
+
+    def render_view(command, **kwargs):
+        """Write an artifact as the Memray subprocess would."""
+        if "-o" in command:
+            Path(command[command.index("-o") + 1]).write_text(
+                "report", encoding="utf-8"
+            )
+        else:
+            kwargs["stdout"].write("stats")
+        return Mock(returncode=0)
+
+    with patch.object(profiles.subprocess, "run", side_effect=render_view):
+        records = profiles.render(tmp_path)
+    destination = tmp_path / "memory-10-temporal.html"
+    if unusable == "timeout":
+        records[1].pop("exit_code")
+        records[1]["error"] = "report_timeout"
+        (tmp_path / "profiles.json").write_text(json.dumps(records))
+    elif unusable == "missing":
+        destination.unlink()
+    elif unusable == "empty":
+        destination.write_text("")
+    else:
+        os.utime(destination, ns=(1, 1))
+
+    with patch.object(profiles.subprocess, "run", side_effect=render_view) as run:
+        recovered = profiles.render(tmp_path, timeout=600)
+    run.assert_called_once()
+    assert "--temporal" in run.call_args.args[0]
+    assert run.call_args.kwargs["timeout"] == 600
+    assert len(recovered) == 4
+    assert all(row.get("exit_code") == 0 and "error" not in row for row in recovered)
+    assert json.loads((tmp_path / "profiles.json").read_text()) == recovered
+    assert capture.read_bytes() == b"saved capture"
+    with patch.object(profiles.subprocess, "run") as run:
+        assert profiles.render(tmp_path) == recovered
+    run.assert_not_called()
+
+
+def test_memray_report_timeout_remains_bounded(tmp_path: Path) -> None:
+    """Keep a timed-out report visible and retain its capture for a later retry."""
+    capture = tmp_path / "memory-10.bin"
+    capture.write_bytes(b"saved capture")
+    with patch.object(
+        profiles.subprocess, "run", side_effect=subprocess.TimeoutExpired("memray", 900)
+    ) as run:
+        records = profiles.render(tmp_path)
+    assert run.call_count == 4
+    assert all(call.kwargs["timeout"] == 900 for call in run.call_args_list)
+    assert all(row.get("error") == "report_timeout" for row in records)
+    assert capture.read_bytes() == b"saved capture"
+    with pytest.raises(ValueError, match="positive"):
+        profiles.render(tmp_path, timeout=0)
 
 
 def test_process_series_is_bounded_and_keeps_complete_totals(tmp_path: Path) -> None:

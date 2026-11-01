@@ -227,9 +227,13 @@ class Driver:
                 self._point(env, version, parts)
 
     def _parts(self) -> list[int]:
-        """Include a small calibration point only when profiling was requested."""
+        """Put overnight profiler controls after the large memory measurements."""
         extra = [self.options.profile_parts] if self.options.profiles else []
-        return sorted(set(self.options.parts + extra))
+        parts = sorted(set(self.options.parts + extra))
+        if self.options.overnight and extra:
+            parts.remove(self.options.profile_parts)
+            parts += extra
+        return parts
 
     def _skip_remaining(self) -> None:
         """Make unstarted points visible after the series budget is exhausted."""
