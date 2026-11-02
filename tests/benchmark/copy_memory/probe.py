@@ -34,7 +34,6 @@ STAGES = (
     (COPIER, "BackupCopier", "_select_backups", "select"),
     (COPIER, "BackupCopier", "_validate_backup_names", "select"),
     (COPIER, "BackupCopier", "_get_source_backup", "load_metadata"),
-    (COPIER, "BackupCopier", "_get_target_metadata", "load_metadata"),
     (COPIER, "BackupCopier", "_make_target_metadata", "target_metadata"),
     (CONTEXT, "CopyContext", "load", "journal_load"),
     (COPIER, "BackupCopier", "_plan_files_scope", "plan_files"),

@@ -125,6 +125,8 @@ class CopyContext:
             logging.warning("Failed to list copy context {}: {}", self._path, e)
             return
         for path in paths:
+            if os.path.dirname(path) != self._path:
+                continue
             try:
                 with NamedTemporaryFile() as source:
                     self._engine.download_file(path, source.name)

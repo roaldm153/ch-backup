@@ -37,7 +37,7 @@ from ch_backup.exceptions import ConfigurationError, TerminatingSignal
 from . import logging
 from .backup.copy_deduplication import copy_deduplication_cutoff
 from .backup.copy_report import CopyReport, print_copy_report
-from .backup.metadata import BackupState, CopyScope, TableMetadata
+from .backup.metadata import BackupState, CopyScope, TableMetadata, parse_copy_scopes
 from .backup.sources import BackupSources
 from .ch_backup import CleanZooKeeperMode, ClickhouseBackup
 from .config import DEFAULT_CONFIG, Config
@@ -263,6 +263,7 @@ def list_command(
     records = []
     for backup in backups:
         data_skipped_tables, incomplete_tables = backup.count_skipped_data_tables()
+        copy = backup.dump(light=True)["meta"].get("copy")
         record: dict = OrderedDict(
             (
                 ("name", backup.name),
@@ -278,12 +279,20 @@ def list_command(
         )
         if format_ == "json":
             record["labels"] = backup.labels
+            record["copy"] = copy
             record["cloud_disks"] = backup.cloud_storage.disks
             record["exception"] = backup.exception
         else:
             record["labels"] = "\n".join(
                 f"{name}: {value}" for name, value in backup.labels.items()
             )
+            copy_lines = [
+                f"{scope}: {status}"
+                for scope, status in (copy or {}).get("scopes", {}).items()
+            ]
+            if copy and copy.get("updated_at"):
+                copy_lines.extend(("", f"updated_at: {copy['updated_at']}"))
+            record["copy"] = "\n".join(copy_lines).lstrip("\n")
         if all_ or include_unreadable:
             record["metadata_error"] = None
         records.append(record)
@@ -299,6 +308,7 @@ def list_command(
                 "data_skipped_tables",
                 "incomplete_tables",
                 "labels",
+                "copy",
             )
         )
         record = {"name": name, "state": "unknown", **record}
@@ -941,13 +951,19 @@ def delete_command(
         "all_",
         is_flag=True,
         default=False,
-        help='Copy all backups in the state "created". Older backups are copied first.',
+        help="Copy created backups, oldest first. Backups without table data are skipped "
+        "by default; use --no-only-with-data to include them.",
     ),
     option(
         "--keep-going",
         is_flag=True,
         default=False,
         help="Continue copying independent objects and backups after errors.",
+    ),
+    option(
+        "--only-with-data/--no-only-with-data",
+        default=None,
+        help="Select only backups with data for LAST and --all. Enabled by default.",
     ),
     option(
         "--report-path",
@@ -961,7 +977,8 @@ def delete_command(
         type=Choice([scope.value for scope in CopyScope]),
         help='Copy only the specified scope: "files" for files of the backup, '
         '"cloud_storage" for data of object storage disks. Can be specified multiple times, '
-        "all scopes are copied by default. The copy is published once every scope is copied. "
+        "overrides copy.scopes in the configuration (all scopes by default). "
+        "The copy is published once every scope is copied. "
         'Without "files", copies are taken from the target storage, so the source storage is '
         'not accessed; --all and LAST select copies with "cloud_storage" not completed.',
     ),
@@ -1037,6 +1054,7 @@ def copy_command(
     cloud_storage_source_bucket: str | None,
     cloud_storage_source_path: str | None,
     keep_going: bool = False,
+    only_with_data: bool | None = None,
     report_path: str | None = None,
     scopes: tuple[str, ...] = (),
 ) -> None:
@@ -1048,8 +1066,12 @@ def copy_command(
             ctx.fail("Either BACKUP or --all must be specified.")
 
         copy_config: dict = {"cloud_storage": {"source": {}, "target": {}}}
+        if scopes:
+            copy_config["scopes"] = list(scopes)
         if server_side_copy is not None:
             copy_config["server_side_copy"] = server_side_copy
+        if only_with_data is not None:
+            copy_config["only_with_data"] = only_with_data
         if resume is not None:
             copy_config["resume"] = resume
         for section, key, value in (
@@ -1067,12 +1089,20 @@ def copy_command(
         )
         target_cfg.merge({"copy": copy_config})
         # Validate before resolving LAST, which already lists the source storage.
+        if not isinstance(target_cfg["copy"]["only_with_data"], bool):
+            raise ConfigurationError("copy.only_with_data must be a boolean")
         copy_deduplication_cutoff(target_cfg["copy"], command_start)
         backup_names = None
         if name:
-            if name == "LAST" and (not scopes or CopyScope.FILES.value in scopes):
+            if name == "LAST" and CopyScope.FILES in parse_copy_scopes(
+                target_cfg["copy"]["scopes"]
+            ):
                 name = _validate_and_resolve_name(
-                    ctx, ch_backup, name, BackupState.CREATED
+                    ctx,
+                    ch_backup,
+                    name,
+                    BackupState.CREATED,
+                    only_with_data=target_cfg["copy"]["only_with_data"],
                 )
             backup_names = [name]
         ch_backup.copy(
@@ -1080,7 +1110,6 @@ def copy_command(
             backup_names,
             keep_going=keep_going,
             report=report,
-            scopes=scopes,
             command_start=command_start,
         )
     except BaseException as e:
@@ -1139,8 +1168,13 @@ def _validate_and_resolve_name(
     ch_backup: ClickhouseBackup,
     name: str,
     backup_state: BackupState = None,
+    only_with_data: bool = False,
 ) -> str:
-    """Check that the backup exists; LAST is refused while any metadata is unreadable."""
+    """
+    Check that the backup exists; LAST is refused while any metadata is unreadable.
+
+    With only_with_data, LAST is resolved to the latest backup with data parts.
+    """
     unreadable: dict[str, str] = {}
     backups = ch_backup.list(backup_state, unreadable=unreadable)
 
@@ -1151,6 +1185,10 @@ def _validate_and_resolve_name(
             )
         if not backups:
             ctx.fail("There are no backups.")
+        if only_with_data:
+            backups = [b for b in backups if not b.is_empty()]
+            if not backups:
+                ctx.fail("There are no backups with data.")
         return backups[0].name
 
     if name not in unreadable and name not in (b.name for b in backups):

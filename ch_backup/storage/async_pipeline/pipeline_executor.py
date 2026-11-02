@@ -225,6 +225,7 @@ class PipelineExecutor:
 
         return self._exec_pipeline(job_id, pipeline, is_async)
 
+    # pylint: disable=too-many-positional-arguments
     def download_file(
         self,
         remote_path: str,
@@ -232,6 +233,8 @@ class PipelineExecutor:
         is_async: bool,
         encryption: bool,
         compression: bool,
+        callback: Callable | None = None,
+        on_error: Callable[[BaseException], None] | None = None,
     ) -> None:
         """
         Download file to local filesystem.
@@ -246,7 +249,7 @@ class PipelineExecutor:
             encryption,
             compression,
         )
-        self._exec_pipeline(job_id, pipeline, is_async)
+        self._exec_pipeline(job_id, pipeline, is_async, callback, on_error)
 
     # pylint: disable=too-many-positional-arguments
     def download_files(
@@ -257,6 +260,7 @@ class PipelineExecutor:
         encryption: bool,
         compression: bool,
         callback: Callable | None,
+        on_error: Callable[[BaseException], None] | None = None,
     ) -> None:
         """
         Download and unarchive tarball to files on local filesystem.
@@ -271,7 +275,7 @@ class PipelineExecutor:
             encryption,
             compression,
         )
-        self._exec_pipeline(job_id, pipeline, is_async, callback=callback)
+        self._exec_pipeline(job_id, pipeline, is_async, callback, on_error)
 
     # pylint: disable=unused-argument
     def delete_files(

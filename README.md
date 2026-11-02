@@ -17,6 +17,22 @@ The tool also supports deduplication at part-level granularity. It's set up
  set a start time to exclude earlier backups from deduplication.
 
 
+## Restore after part download errors
+
+Restore attaches a part only after all its files have been downloaded and unpacked,
+or its cloud-storage copy has completed. Failed parts are recorded as `invalid`
+with the original download or copy error in the restore state file.
+With `--keep-going`, other parts continue restoring; without it, the command
+stops with the download or copy error. With `--keep-going`, set
+`backup.restore_fail_on_attach_error: true` to return a nonzero exit code if any
+part failed to download, copy, or attach. The default remains `false`.
+A new restore invocation retries invalid parts, attaches already downloaded
+parts, and skips restored parts.
+Successfully downloaded parts are attached in their original part order,
+regardless of download completion order. Saved failure details survive restores
+of other tables; a part's error is removed after that part is successfully attached.
+Only failures from the current invocation affect its exit code.
+
 ## Restore without cloud storage
 
 `ch-backup restore --skip-cloud-storage BACKUP` restores local parts and skips
@@ -148,7 +164,7 @@ Commands:
 
 ### Copying backups to another storage
 
-`ch-backup copy` copies a backup (or all backups with `--all`) to another S3 bucket,
+`ch-backup copy` copies a backup (or selected created backups with `--all`) to another S3 bucket,
 endpoint or `backup.path_root`. The main configuration describes the source storage. The
 target storage is described by the main configuration merged with a configuration file passed
 in `--target-config` and values passed in `--target-config-parameter`, so it's enough to
@@ -184,6 +200,14 @@ storage:
 
 Behavior and limitations:
 
+- `copy.only_with_data` is enabled by default: `LAST` selects the latest created backup
+  with data, and `--all` skips backups without data. The filter uses the data size in backup
+  metadata, including deduplicated and detached parts. Override it with
+  `--only-with-data` / `--no-only-with-data`. Backups explicitly selected by name are copied
+  regardless of this setting. Schema-only and access-control-only backups are excluded too:
+  access entities and other definitions do not count as table data. To preserve all created
+  snapshots, including permission changes in access-only backups, use
+  `copy --all --no-only-with-data` or set `copy.only_with_data: false`.
 - A final text report lists copied, skipped, failed and unprocessed backups. `--report-path`
   also saves a JSON report (schema version 1) once the command finishes, including failures
   and handled termination signals. Any failure gives a nonzero exit code.
@@ -243,21 +267,29 @@ Behavior and limitations:
   the copied data. Backups without such data, including ones created with
   `--copy-cloud-storage-data`, are copied entirely by `files`, and their scope `cloud_storage` is
   completed right away. `--scope` (can be given multiple times) copies only the specified scopes,
-  all of them by default. Each run chooses its own copy mode with `--[no-]server-side-copy`. `files`
-  also copies metadata of the backup and the original disk metadata into
+  overriding `copy.scopes` in the configuration (default: `[files, cloud_storage]`). For example,
+  `copy: {scopes: [cloud_storage]}` selects only object storage copying. The list must be non-empty.
+  The setting is read from the merged target configuration, so it can be set in the main config,
+  `--target-config` or `--target-config-parameter copy.scopes '["files"]'`.
+  Each run chooses its own copy mode with `--[no-]server-side-copy`. `files`
+  also copies the original disk metadata into
   `<backup>/copy_context/<id>/source/` and saves the list of its objects in
   `<backup>/copy_context/<id>/manifest/files.jsonl.gz` (locations and sizes, without credentials). A
   run without `files` does not access the source storage: it takes copies from the target storage
   (the specified ones, or with `--all` every copy whose `cloud_storage` is not completed, or the
-  newest of them for `LAST`), reads metadata from `source/`, copies disk metadata that needs no
-  rewriting from there and checks `files` by the manifest. So `files` must be copied first, from a
+  newest of them for `LAST`), reads the copy's full metadata and disk metadata from `source/`,
+  copies disk metadata that needs no rewriting from there and checks `files` by the manifest.
+  The copy retains the original cloud storage location until it is published as `created`. So `files` must be copied first, from a
   host with access to the source storage; `cloud_storage` needs only access to the buckets of the
   disks. A scope that is not copied is planned only if it is completed, to check it with the same
   settings as copying it, so copying only the scope `files` needs no settings of object storage data
   while `cloud_storage` is not completed. Statuses of the scopes (`pending`, `completed`, `failed`)
   are saved in `meta.copy` of the copy, for example `state: creating, copy: {scopes: {files:
   completed, cloud_storage: pending}, updated_at: ...}`, where `updated_at` is when copying was last
-  saved. The copy becomes `created` once every scope is completed. Until then the report shows the
+  saved. `list -av` shows these values in the `copy` column; `list -av --format json` includes
+  the same `copy` object. Backups without `meta.copy` have an empty cell or JSON `null`.
+  The listing reads light metadata, including the saved copy scopes and timestamp.
+  The copy becomes `created` once every scope is completed. Until then the report shows the
   backup as `partial` with `backup_state: creating`, and the command exits with 0 if the copied
   scopes succeed. Saved statuses are not trusted: a scope that is not copied is completed only if
   the copy context and the target listing confirm all its objects, otherwise it becomes `pending`

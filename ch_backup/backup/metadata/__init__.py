@@ -8,6 +8,7 @@ from ch_backup.backup.metadata.backup_metadata import (
     BackupState,
     CopyScope,
     CopyScopeStatus,
+    parse_copy_scopes,
     sanitize_backup_name,
 )
 from ch_backup.backup.metadata.cloud_storage_metadata import CloudStorageMetadata

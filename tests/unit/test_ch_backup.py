@@ -19,6 +19,8 @@ from ch_backup.backup.metadata import (
     BackupMetadata,
     BackupState,
     CloudStorageMetadata,
+    CopyScope,
+    CopyScopeStatus,
     PartMetadata,
     TableMetadata,
 )
@@ -569,7 +571,7 @@ def test_referenced_delete_persists_partial_state() -> None:
 
 def _readable_backup(name: str, link: str | None = None) -> Mock:
     """Mock light metadata of a readable backup with one part linked to link."""
-    meta = Mock(state=BackupState.CREATED, copy=None)
+    meta = Mock(state=BackupState.CREATED, copy_scopes={})
     meta.name = name
     part = Mock(link=link, database="db", table="table", deduplicated_part_name="p")
     meta.get_databases.return_value = ["db"]
@@ -583,7 +585,7 @@ def _light_backup(
     """Mock light metadata of a created backup started age_days ago."""
     meta = Mock(
         state=BackupState.CREATED,
-        copy=None,
+        copy_scopes={},
         start_time=util.now() - timedelta(days=age_days),
         schema_only=schema_only,
     )
@@ -707,7 +709,10 @@ def partial_copy_fixture(request: pytest.FixtureRequest) -> Mock:
     backup.schema_only = False
     backup.count_skipped_data_tables.return_value = (0, 0)
     backup.configure_mock(
-        copy={"scopes": {"files": "completed", "cloud_storage": cloud_status}}
+        copy_scopes={
+            CopyScope.FILES: CopyScopeStatus.COMPLETED,
+            CopyScope.CLOUD_STORAGE: CopyScopeStatus(cloud_status),
+        }
     )
     return backup
 
@@ -837,7 +842,11 @@ def test_other_incomplete_copies_keep_temporary_retention(
     """Other incomplete copies neither consume retention count nor lose grace time."""
     copy = _copy(_light_backup("copy", 30), updated_days=1)
     copy.state = state
-    copy.configure_mock(copy={"scopes": scopes} if scopes is not None else None)
+    metadata = BackupMetadata(
+        "copy", "test", "test", DEFAULT_CONFIG["backup"]["time_format"]
+    ).dump(light=True)
+    metadata["meta"]["copy"] = {"scopes": scopes} if scopes is not None else None
+    copy.configure_mock(copy_scopes=BackupMetadata.load(metadata).copy_scopes)
     assert not _purge(
         [copy, _light_backup("older", 31)], retain_count=1, retain_time={}
     )
@@ -853,7 +862,10 @@ def test_copy_scopes_do_not_protect_deleted_backups(state: BackupState) -> None:
     copy = _copy(_light_backup("copy", 30), updated_days=1)
     copy.state = state
     copy.configure_mock(
-        copy={"scopes": {"files": "completed", "cloud_storage": "pending"}}
+        copy_scopes={
+            CopyScope.FILES: CopyScopeStatus.COMPLETED,
+            CopyScope.CLOUD_STORAGE: CopyScopeStatus.PENDING,
+        }
     )
     assert not _purge(
         [copy, _light_backup("older", 31)], retain_count=1, retain_time={}

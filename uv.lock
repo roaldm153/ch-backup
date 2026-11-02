@@ -258,7 +258,7 @@ dev = [
     { name = "isort", specifier = ">=6.0" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "matplotlib", specifier = ">=3.8" },
-    { name = "mypy", specifier = ">=1.10,<2.4" },
+    { name = "mypy", specifier = ">=1.10,<2.5" },
     { name = "mypy-boto3-s3", specifier = ">=1.38" },
     { name = "prometheus-client", specifier = "==0.26.0" },
     { name = "pyhamcrest", specifier = ">=2.1" },

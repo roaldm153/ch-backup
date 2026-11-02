@@ -623,13 +623,12 @@ class ClickhouseBackup:
         *,
         keep_going: bool = False,
         report: CopyReport | None = None,
-        scopes: Sequence[str] | None = None,
         command_start: datetime | None = None,
     ) -> tuple[Sequence[str], Sequence[str]]:
         """
         Copy backups to the storage specified in the target config.
         If backup names are not specified, all backups in the state "created" are copied.
-        If scopes are not specified, all of them are copied.
+        Copy scopes are taken from the target configuration, all of them by default.
 
         Return names of copied backups and names of backups skipped as already copied.
         The optional report also receives partial results when copying raises.
@@ -654,7 +653,6 @@ class ClickhouseBackup:
                     backup_names,
                     keep_going=keep_going,
                     report=report,
-                    scopes=scopes,
                     command_start=command_start,
                 )
         except BaseException as e:
@@ -1068,7 +1066,7 @@ class ClickhouseBackup:
                 )
 
             if sources.data and self._context.restore_context.has_failed_parts():
-                msg = "Some parts are failed to attach"
+                msg = "Some parts failed to restore"
                 logging.warning(msg)
 
                 if self._context.config["restore_fail_on_attach_error"]:
@@ -1169,12 +1167,11 @@ def _zookeeper_roots_differ(ch_config: dict, zk_config: dict) -> bool:
 
 def _is_partial_copy(backup: BackupMetadata) -> bool:
     """Check for copied files with cloud storage still pending or failed."""
-    scopes = (backup.copy or {}).get("scopes") or {}
     return (
         backup.state in (BackupState.CREATING, BackupState.FAILED)
-        and scopes.get(CopyScope.FILES.value) == CopyScopeStatus.COMPLETED.value
-        and scopes.get(CopyScope.CLOUD_STORAGE.value)
-        in (CopyScopeStatus.PENDING.value, CopyScopeStatus.FAILED.value)
+        and backup.copy_scopes.get(CopyScope.FILES) == CopyScopeStatus.COMPLETED
+        and backup.copy_scopes.get(CopyScope.CLOUD_STORAGE)
+        in (CopyScopeStatus.PENDING, CopyScopeStatus.FAILED)
     )
 
 
