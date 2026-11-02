@@ -7,6 +7,20 @@ import sys
 from pathlib import Path
 
 
+def capture_views(directory: Path, capture: str) -> tuple[str, ...]:
+    """Choose only reports supported by the recorded Memray format."""
+    manifest = directory / capture.replace("memory-", "instrumentation-").replace(
+        ".bin", ".json"
+    )
+    if (
+        manifest.exists()
+        and json.loads(manifest.read_text(encoding="utf-8")).get("memory_format")
+        == "aggregated"
+    ):
+        return ("peak", "leaks")
+    return ("peak", "temporal", "temporary", "stats")
+
+
 def coverage(directory: Path, kind: str) -> dict:
     """Validate usable captures and explicitly report missing spawn workers."""
     if kind == "cpu":
@@ -79,7 +93,7 @@ def coverage(directory: Path, kind: str) -> dict:
         == {
             (f"memory-{pid}.bin", view)
             for pid in manifests
-            for view in ("peak", "temporal", "temporary", "stats")
+            for view in capture_views(directory, f"memory-{pid}.bin")
         }
     )
     return {
@@ -109,7 +123,10 @@ def render(directory: Path, timeout: int = 900) -> list[dict]:
             ("temporal", ["--temporal"]),
             ("temporary", ["--temporary-allocation-threshold", "100"]),
             ("stats", []),
+            ("leaks", ["--leaks"]),
         ):
+            if view not in capture_views(directory, capture.name):
+                continue
             destination = capture.with_name(f"{capture.stem}-{view}.html")
             command = [
                 sys.executable,

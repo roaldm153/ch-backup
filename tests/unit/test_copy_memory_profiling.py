@@ -137,7 +137,7 @@ def test_budget_expiry_keeps_point_and_cleanup(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("largest", [30000, 120000])
 def test_overnight_controls_and_large_points(largest: int) -> None:
-    """Keep heavy profiles on the small point and rotate their order across repeats."""
+    """Profile each measured size after plain runs, reusing its source and modes."""
     # pylint: disable=protected-access
     with patch("docker.from_env"):
         driver = importlib.import_module("tests.benchmark.copy_memory.driver")
@@ -147,7 +147,6 @@ def test_overnight_controls_and_large_points(largest: int) -> None:
             versions=["26.3"],
             overnight=True,
             profiles=True,
-            profile_parts=2,
         )
     )
     inventory = {"unique_objects": 3_000_000, "metadata_format_version": 5}
@@ -155,28 +154,107 @@ def test_overnight_controls_and_large_points(largest: int) -> None:
         10000,
         20000,
         largest,
-        2,
-    ]
-    controls = benchmark._runs(2, False, inventory)
-    assert len(controls) == 9
-    assert len({run.path_root for run in controls}) == 9
-    assert [run.profile for run in controls[:6]] == [
-        None,
-        "cpu",
-        "memory",
-        "cpu",
-        "memory",
-        None,
     ]
     assert not benchmark._fits(10000, 3_000_000)
     for parts in (10000, 20000, largest):
         large = benchmark._runs(parts, False, inventory)
-        assert [run.mode for run in large] == [
+        assert [run.mode for run in large[:3]] == [
             "planning_only",
             "metadata_only",
             "metadata_only",
         ]
-        assert all(run.kind != "tracemalloc" and run.profile is None for run in large)
+        assert [run.profile for run in large] == [None] * 3 + ["cpu"] * 3 + [
+            "memory"
+        ] * 3
+        assert len({run.name for run in large}) == 9
+        for start in (0, 3, 6):
+            assert large[start + 1].path_root == large[start + 2].path_root
+        assert len({large[start + 1].path_root for start in (0, 3, 6)}) == 3
+
+
+def test_repeated_ab_runs_keep_modes_and_targets_separate() -> None:
+    """Pair repeats without mixing fresh/resume targets or including interrupted copies."""
+    # pylint: disable=protected-access
+    with patch("docker.from_env"):
+        driver = importlib.import_module("tests.benchmark.copy_memory.driver")
+    benchmark = driver.Driver(
+        driver.Options(
+            parts=[10000],
+            versions=["26.3"],
+            ab=True,
+            repeats=3,
+            baseline_ref="old",
+            candidate_ref="new",
+            profiles=True,
+        )
+    )
+    runs = benchmark._runs(
+        10000, False, {"metadata_format_version": 5, "unique_objects": 100}
+    )  # pylint: disable=protected-access
+    assert len(runs) == 15
+    assert [r.repeat for r in runs[:9]] == [1] * 3 + [2] * 3 + [3] * 3
+    assert all(r.profile is None for r in runs[:9])
+    assert all(r.profile for r in runs[9:])
+    assert len({r.name for r in runs}) == len(runs)
+    assert len({runs[n].path_root for n in (1, 4, 7)}) == 3
+    assert not benchmark._fits(10000, 100)  # pylint: disable=protected-access
+    benchmark.options.copy_mode = "full"
+    assert benchmark._fits(10000, 100)  # pylint: disable=protected-access
+    full = benchmark._runs(
+        10000, True, {"metadata_format_version": 5, "unique_objects": 100}
+    )  # pylint: disable=protected-access
+    assert not any(r.kind in ("interrupted", "resume_interrupted") for r in full)
+
+
+def test_aggregated_memray_views_and_coverage(tmp_path: Path) -> None:
+    """Do not invoke temporal or stats reporters for an aggregated capture."""
+    (tmp_path / "memory-10.bin").write_bytes(b"aggregate")
+    (tmp_path / "observed.json").write_text('{"10": {"created": 100}}')
+    (tmp_path / "instrumentation-10.json").write_text(
+        json.dumps(
+            {
+                "pid": 10,
+                "created": 100,
+                "memory": True,
+                "status": "completed",
+                "memory_format": "aggregated",
+            }
+        )
+    )
+    with patch.object(
+        profiles.subprocess, "run", return_value=Mock(returncode=0)
+    ) as run:
+        records = profiles.render(tmp_path)
+    assert run.call_count == 2
+    assert [r["view"] for r in records] == ["peak", "leaks"]
+    assert "--leaks" in run.call_args.args[0]
+    assert profiles.coverage(tmp_path, "memory")["profile_status"] == "complete"
+    (tmp_path / "profiles.json").write_text(json.dumps(records[:1]))
+    assert profiles.coverage(tmp_path, "memory")["profile_status"] == "incomplete"
+
+
+def test_ab_comparison_uses_only_matching_successful_pairs() -> None:
+    """Exclude failed and profiled repeats without treating missing RAM as zero."""
+    base = {
+        "kind": "fresh_planning",
+        "mode": "planning_only",
+        "repeat": 1,
+        "exit_code": 0,
+    }
+    runs = [
+        {**base, "variant": "baseline", "duration": 20},
+        {**base, "variant": "candidate", "duration": 10},
+        {**base, "repeat": 2, "variant": "baseline", "duration": 1, "exit_code": 1},
+        {**base, "repeat": 2, "variant": "candidate", "duration": 999},
+        {**base, "profile": "memory", "variant": "candidate", "duration": 999},
+    ]
+    rows = report.comparison_rows([{"version": "26.3", "parts": 10000, "runs": runs}])
+    assert len(rows) == 1
+    assert rows[0]["pairs"] == 1
+    assert rows[0]["metric"] == "wall_s"
+    assert rows[0]["baseline"] == 20
+    assert rows[0]["candidate"] == 10
+    assert rows[0]["delta_percent"] == -50
 
 
 def test_collector_rejects_recycled_pid(tmp_path: Path) -> None:

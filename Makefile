@@ -12,6 +12,8 @@ export CLICKHOUSE_VERSIONS ?= 25.8.23.13,26.3.12.3
 export BENCH_COLUMNS ?= 120
 export BENCH_WORKERS ?= 4
 export BASELINE_REF ?=
+export CANDIDATE_REF ?= HEAD
+export BENCH_REPEATS ?= 3
 
 export BUILD_PYTHON_OUTPUT_DIR ?= dist
 export BUILD_DEB_OUTPUT_DIR ?= out
@@ -134,6 +136,12 @@ test-benchmark-copy-memory-overnight: CLICKHOUSE_VERSIONS = 26.3.12.3
 test-benchmark-copy-memory-overnight: override BENCH_ARGS += --overnight
 test-benchmark-copy-memory-overnight: test-benchmark-copy-memory
 
+.PHONY: test-benchmark-copy-memory-ab
+test-benchmark-copy-memory-ab: BENCH_PARTS = 10000
+test-benchmark-copy-memory-ab: CLICKHOUSE_VERSIONS = 26.3.12.3
+test-benchmark-copy-memory-ab: override BENCH_ARGS += --ab --candidate-ref $(CANDIDATE_REF) --repeats $(BENCH_REPEATS) --profiles
+test-benchmark-copy-memory-ab: test-benchmark-copy-memory
+
 
 .PHONY: clean
 clean: clean-test-env clean-pycache clean-debuild
@@ -251,7 +259,8 @@ help:
 	@echo "  test-integration           Run integration tests."
 	@echo "  test-integration-parallel  Run whole features in isolated parallel environments."
 	@echo "  test-benchmark-copy-memory Measure memory of copying data of object storage disks."
-	@echo "  test-benchmark-copy-memory-overnight  Bounded nightly measurements and profiler controls."
+	@echo "  test-benchmark-copy-memory-overnight  Bounded nightly measurements and profiles per point."
+	@echo "  test-benchmark-copy-memory-ab         Compare BASELINE_REF and CANDIDATE_REF at BENCH_PARTS."
 	@echo "  isort                      Perform isort checks."
 	@echo "  black                      Perform black checks."
 	@echo "  codespell                  Perform codespell checks."

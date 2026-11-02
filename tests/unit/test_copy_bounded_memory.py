@@ -105,8 +105,11 @@ def test_entry_index_rejects_cross_part_conflicts_and_keeps_secrets_in_memory() 
 def test_plan_and_listing_iterate_in_order_and_roll_back_incomplete_import() -> None:
     """Keep existing confirmations when a later journal chunk is corrupt."""
     entries = CopyEntries(_entry(str(i)) for i in range(300))
+    queries: list[str] = []
+    entries._index._db.set_trace_callback(queries.append)
     assert len(entries) == 300
     assert [entry.src_path for entry in entries] == [f"src/{i}" for i in range(300)]
+    assert len(queries) == 4
     records: CopyIndex[bytes, bool] = CopyIndex()
     records[b"old"] = True
     with pytest.raises(ValueError):
@@ -116,6 +119,63 @@ def test_plan_and_listing_iterate_in_order_and_roll_back_incomplete_import() -> 
             raise ValueError("truncated gzip")
     assert list(records) == [b"old"]
     assert len(records) == 1
+
+
+@pytest.mark.parametrize("view_name", ["values", "items"])
+@pytest.mark.parametrize("size", [0, 1, 128, 129, 300])
+def test_index_views_scan_in_batches(view_name: str, size: int) -> None:
+    """Read each batch once without issuing a lookup for every record."""
+    index: CopyIndex[tuple, int] = CopyIndex()
+    expected = {(("s3", "bucket"), f"part/{i}"): i for i in range(size)}
+    index.update(expected)
+    queries: list[str] = []
+    index._db.set_trace_callback(queries.append)
+    view = getattr(index, view_name)()
+    iterator = iter(view)
+    assert not queries
+    if size:
+        assert next(iterator) == next(iter(getattr(expected, view_name)()))
+        assert len(queries) == 1
+    list(iterator)
+    assert len(queries) == (size + 127) // 128 + 1
+    assert list(view) == list(getattr(expected, view_name)())
+    assert len(view) == size
+
+
+@pytest.mark.parametrize("view_name", ["values", "items"])
+def test_entry_index_views_remain_live(view_name: str) -> None:
+    """Reuse views after updates while preserving storage identity and order."""
+    index: EntryIndex[str] = EntryIndex()
+    first = _entry("first")
+    last = _entry("last")
+    index["first"] = first
+    view = getattr(index, view_name)()
+    updated = first._replace(size=42)
+    index["last"] = last
+    index["first"] = updated
+    expected = {"first": updated, "last": last}
+    assert list(view) == list(getattr(expected, view_name)())
+    assert len(view) == 2
+    for entry in index.values():
+        assert entry.src_storage is first.src_storage
+        assert entry.dst_storage is first.dst_storage
+    del index["first"]
+    assert len(view) == 1
+    assert next(iter(getattr({"last": last}, view_name)())) in view
+    index.clear()
+    assert not view
+    assert not list(view)
+
+
+def test_index_updates_serialize_once() -> None:
+    """Serialize a replacement once and keep its position and row count."""
+    index: CopyIndex[str, int] = CopyIndex()
+    index.update({"first": 1, "last": 2})
+    with patch.object(index, "_encode", wraps=index._encode) as encode:
+        index["first"] = 3
+    encode.assert_called_once_with(3)
+    assert len(index) == 2
+    assert list(index.items()) == [("first", 3), ("last", 2)]
 
 
 def test_failed_journal_uploads_keep_bounded_retry_chunks() -> None:

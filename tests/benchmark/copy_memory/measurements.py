@@ -193,15 +193,22 @@ def s3_lines(points: list[dict]) -> list[str]:
                     _bound(quantile_bound(row["call"], q)) for q in (0.5, 0.95, 0.99)
                 ]
                 lines.append(
-                    f"| {point['version']} / {point['parts']} / {run['kind']}-{run['variant']} "
+                    f"| {point['version']} / {point['parts']} / {run_name(run)} "
                     f"| {operation} | {count:g} | {row['attempt'].get('+Inf', 0):g} "
                     f"| {row['errors']:g} | {row['http_errors']:g} | {row['retries']:g} | {rate:.1f} | {' | '.join(bounds)} |"
                 )
     return lines
 
 
+def run_name(run: dict) -> str:
+    """Keep repeated runs distinct while reading older result manifests."""
+    suffix = f"_{run['repeat']}" if run.get("repeat") else ""
+    return run.get("name", f"{run['kind']}{suffix}-{run['variant']}")
+
+
 def overhead_lines(points: list[dict]) -> list[str]:
     """Compare only repeated controls of the same point, variant and copy mode."""
+    # pylint: disable=too-many-locals
     lines = [
         "",
         "## Накладные расходы профилирования",
@@ -209,20 +216,33 @@ def overhead_lines(points: list[dict]) -> list[str]:
         "Контроли используют один исходный backup и разные пустые target-префиксы. "
         "Порядок профайлеров чередуется; кеши ОС не очищаются. CPU-профиль охватывает только записанные окна.",
         "",
-        "| Версия / парты / вариант | Профиль | N | Медиана, с | Мин–макс, с | Δ времени | Медиана суммы RSS, ГиБ | Δ RSS |",
-        "|---|---|---|---|---|---|---|---|",
+        "| Версия / парты / вариант | Режим / сценарий | Профиль | N | Медиана, с | Мин–макс, с | Δ времени | Медиана суммы RSS, ГиБ | Δ RSS |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for point in points:
         groups: dict = defaultdict(list)
         for run in point["runs"]:
             if (
-                run["kind"].startswith("control_")
-                and run.get("exit_code") == 0
+                run.get("exit_code") == 0
+                and run["kind"]
+                not in ("tracemalloc", "interrupted", "resume_interrupted")
                 and run.get("profile_status", "complete") == "complete"
             ):
-                groups[(run["variant"], run.get("profile") or "plain")].append(run)
-        for (variant, kind), runs in sorted(groups.items()):
-            plain = groups.get((variant, "plain"), [])
+                case = (
+                    "control"
+                    if run["kind"].startswith("control_")
+                    else run.get("case") or run["kind"]
+                )
+                groups[
+                    (
+                        run["variant"],
+                        run.get("mode", "full"),
+                        case,
+                        run.get("profile") or "plain",
+                    )
+                ].append(run)
+        for (variant, mode, case, kind), runs in sorted(groups.items()):
+            plain = groups.get((variant, mode, case, "plain"), [])
             baseline = statistics.median(r["duration"] for r in plain) if plain else 0
             duration = statistics.median(r["duration"] for r in runs)
             memory = [
@@ -245,7 +265,7 @@ def overhead_lines(points: list[dict]) -> list[str]:
             )
             times = [r["duration"] for r in runs]
             lines.append(
-                f"| {point['version']} / {point['parts']} / {variant} | {kind} | {len(runs)} | {duration:.1f} | {min(times):.1f}–{max(times):.1f} | {delta} | {ram} | {ram_delta} |"
+                f"| {point['version']} / {point['parts']} / {variant} | {mode} / {case} | {kind} | {len(runs)} | {duration:.1f} | {min(times):.1f}–{max(times):.1f} | {delta} | {ram} | {ram_delta} |"
             )
     return lines
 
@@ -257,7 +277,8 @@ def profile_lines(points: list[dict]) -> list[str]:
         "## Профили функций",
         "",
         "CPU JSON открывается в Speedscope. Memray HTML показывает heap-выделения, не RSS. "
-        "Peak — живые выделения на пике; temporal — выбор интервала; temporary — освобождённые "
+        "Peak — живые выделения на пике; leaks — оставшиеся в конце записи. "
+        "Агрегированный формат поддерживает peak/leaks; полная трасса также даёт temporal — выбор интервала; temporary — освобождённые "
         "в пределах 100 последующих выделений. Это разные показатели, их не складывают.",
         "",
     ]

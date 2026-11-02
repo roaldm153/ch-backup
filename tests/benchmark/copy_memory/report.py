@@ -53,7 +53,7 @@ def load(root: Path) -> list[dict]:
             json.loads(inventory_file.read_text()) if inventory_file.exists() else {}
         )
         for run in point["runs"]:
-            run_dir = point_file.parent / f"{run['kind']}-{run['variant']}"
+            run_dir = point_file.parent / measurements.run_name(run)
             run["dir"] = run_dir
             run["stages"] = _read_lines(run_dir / "stages.jsonl")
             _load_run(run, run_dir)
@@ -529,7 +529,7 @@ def _run_lines(points: list[dict]) -> list[str]:
                 f"{run_peaks['main'] / count:.0f}" if count and run["stages"] else "—"
             )
             lines.append(
-                f"| {point['version']} | {point['parts']} | {run['kind']}-{run['variant']} "
+                f"| {point['version']} | {point['parts']} | {measurements.run_name(run)} "
                 f"| {run['mode']} | {run.get('outcome', 'unknown')} "
                 f"| {run['exit_code']} | {run['duration']:.0f} | {count} "
                 f"| {' | '.join(values)} | {per_object} |"
@@ -542,8 +542,8 @@ def _status_lines(points: list[dict]) -> list[str]:
     lines = [
         "## Состояние точек",
         "",
-        "| Версия | Партов | Статус | Backup, с | Ошибка |",
-        "|---|---|---|---|---|",
+        "| Версия | Партов | Статус / фаза | Backup, с | Очистка / с | Ошибка |",
+        "|---|---|---|---|---|---|",
     ]
     for point in points:
         errors = "; ".join(
@@ -552,9 +552,13 @@ def _status_lines(points: list[dict]) -> list[str]:
             if point.get(key)
         )
         errors = errors.replace("|", "\\|").replace("\n", " ")
+        cleanup = point.get("cleanup", {})
+        if cleanup.get("error"):
+            errors += "; " + cleanup["error"].replace("|", "\\|").replace("\n", " ")
         lines.append(
-            f"| {point['version']} | {point['parts']} | {point.get('status', 'unknown')} "
-            f"| {point.get('timings', {}).get('backup', 0):.0f} | {errors} |"
+            f"| {point['version']} | {point['parts']} | {point.get('status', 'unknown')} / {point.get('phase', '—')} "
+            f"| {point.get('timings', {}).get('backup', 0):.0f} "
+            f"| {cleanup.get('status', '—')} / {point.get('timings', {}).get('cleanup', 0):.0f} | {errors} |"
         )
     return lines + [""]
 
@@ -579,7 +583,7 @@ def _sample_lines(points: list[dict]) -> list[str]:
             if not stats:
                 continue
             lines.append(
-                f"| {point['version']} | {point['parts']} | {run['kind']}-{run['variant']} "
+                f"| {point['version']} | {point['parts']} | {measurements.run_name(run)} "
                 f"| {run.get('outcome', 'unknown')} | {stats['t']:.1f} | {stats['stage']} "
                 f"| {stats['main_rss'] / GIB:.2f} / {stats['workers_rss'] / GIB:.2f} "
                 f"| {stats['peak_main_rss'] / GIB:.2f} / {stats['peak_workers_rss'] / GIB:.2f} |"
@@ -662,6 +666,97 @@ def _structure_lines(structures: list) -> list[str]:
     return lines
 
 
+def comparison_rows(points: list[dict]) -> list[dict]:
+    """Compare successful, unprofiled A/B pairs with matching cases and repeats."""
+    rows = []
+    for point in points:
+        pairs: dict = defaultdict(dict)
+        for run in point["runs"]:
+            if (
+                run.get("exit_code") == 0
+                and run["kind"] in (*FRESH_RUNS, *RESUME_RUNS)
+                and not run.get("profile")
+            ):
+                pairs[(run["kind"], run.get("mode", "full"), run.get("repeat", 0))][
+                    run["variant"]
+                ] = run
+        groups: dict = defaultdict(list)
+        for (kind, mode, _repeat), pair in pairs.items():
+            if set(pair) != {"baseline", "candidate"}:
+                continue
+            values = {variant: _comparison_values(run) for variant, run in pair.items()}
+            for metric in values["baseline"].keys() & values["candidate"].keys():
+                groups[(kind, mode, metric)].append(
+                    (values["baseline"][metric], values["candidate"][metric])
+                )
+        for (kind, mode, metric), pairs_values in sorted(groups.items()):
+            base = statistics.median(a for a, _ in pairs_values)
+            candidate = statistics.median(b for _, b in pairs_values)
+            rows.append(
+                {
+                    "version": point["version"],
+                    "parts": point["parts"],
+                    "kind": kind,
+                    "mode": mode,
+                    "metric": metric,
+                    "pairs": len(pairs_values),
+                    "baseline": base,
+                    "candidate": candidate,
+                    "delta_percent": 100 * (candidate / base - 1) if base else None,
+                }
+            )
+    return rows
+
+
+def _comparison_values(run: dict) -> dict[str, float]:
+    """Keep unknown memory and CPU measurements out of comparisons."""
+    values = {"wall_s": run["duration"]}
+    stages = run.get("stages", [])
+    if stages:
+        values.update(
+            {
+                f"{name}_gib": value / GIB
+                for name, value in peaks(stages).items()
+                if name != "total"
+            }
+        )
+        if all("cpu_main" in stage and "cpu_workers" in stage for stage in stages):
+            values["cpu_s"] = sum(
+                stage["cpu_main"] + stage["cpu_workers"] for stage in stages
+            )
+    total = run.get("sample_stats", {}).get("peak_total_rss")
+    if total is not None:
+        values["sampled_total_gib"] = total / GIB
+    return values
+
+
+def _comparison_lines(points: list[dict]) -> list[str]:
+    """Render paired medians separately from profiler overhead and partial runs."""
+    rows = comparison_rows(points)
+    if not rows:
+        return []
+    lines = [
+        "",
+        "## A/B: baseline → candidate",
+        "",
+        "Медианы только завершённых пар одинакового сценария и повтора, без тяжёлых профайлеров. "
+        "Δ = candidate / baseline − 1; отрицательное значение означает уменьшение. "
+        "main/worker — пики по этапам; sampled_total — максимум суммы RSS по выборке. CPU — учтённое время по сегментам.",
+        "",
+        "| Версия / парты | Сценарий / режим | Метрика | Пар | Baseline | Candidate | Δ |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for row in rows:
+        delta = (
+            f"{row['delta_percent']:+.1f}%" if row["delta_percent"] is not None else "—"
+        )
+        lines.append(
+            f"| {row['version']} / {row['parts']} | {row['kind']} / {row['mode']} | {row['metric']} "
+            f"| {row['pairs']} | {row['baseline']:.3f} | {row['candidate']:.3f} | {delta} |"
+        )
+    return lines
+
+
 def render_markdown(points: list[dict], structures: list) -> str:
     """Return report.md with inventory, peaks, stages and the forecast."""
     lines = ["# Память ch-backup copy", ""]
@@ -669,6 +764,7 @@ def render_markdown(points: list[dict], structures: list) -> str:
     lines += _inventory_lines(points)
     lines += _run_lines(points)
     lines += _sample_lines(points)
+    lines += _comparison_lines(points)
     lines += measurements.overhead_lines(points)
     lines += measurements.profile_lines(points)
     lines += measurements.s3_lines(points)
@@ -676,7 +772,9 @@ def render_markdown(points: list[dict], structures: list) -> str:
     for point in points:
         for run in point["runs"]:
             if run.get("sample_stats"):
-                name = f"{point['version']}_{point['parts']}_{run['kind']}-{run['variant']}"
+                name = (
+                    f"{point['version']}_{point['parts']}_{measurements.run_name(run)}"
+                )
                 lines += ["", f"![RAM: {name}](timeline_{name}.png)", ""]
     lines += _stage_lines(points)
     lines += _forecast_lines(points)
@@ -721,11 +819,21 @@ def build(root: Path) -> None:
                 point,
                 run,
                 root
-                / f"timeline_{point['version']}_{point['parts']}_{run['kind']}-{run['variant']}.png",
+                / f"timeline_{point['version']}_{point['parts']}_{measurements.run_name(run)}.png",
             )
     structures = plot_structures(points, root / "structures.png")
     temporary = root / "report.tmp.md"
     text = render_markdown(points, structures)
+    if (root / "options.json").exists():
+        options = json.loads((root / "options.json").read_text(encoding="utf-8"))
+        if options.get("baseline_commit"):
+            text = text.replace(
+                "## A/B: baseline → candidate\n",
+                "## A/B: baseline → candidate\n\n"
+                f"Baseline: `{options['baseline_commit']}`; "
+                f"candidate: `{options.get('candidate_commit', 'working tree')}`.\n",
+                1,
+            )
     if (root / "series.json").exists():
         status = json.loads((root / "series.json").read_text())["status"]
         text = text.replace(
@@ -735,6 +843,11 @@ def build(root: Path) -> None:
         )
     temporary.write_text(text)
     temporary.replace(root / "report.md")
+    temporary = root / "comparison.tmp.json"
+    temporary.write_text(
+        json.dumps(comparison_rows(points), indent=2), encoding="utf-8"
+    )
+    temporary.replace(root / "comparison.json")
 
 
 def plot_resources(series: list[dict], out: Path) -> None:

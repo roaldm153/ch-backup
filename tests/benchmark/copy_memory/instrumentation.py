@@ -130,6 +130,11 @@ class Instrumentation:
                 ),
                 native_traces=settings.get("native", False),
                 trace_python_allocators=settings.get("python_allocators", False),
+                file_format=(
+                    memray.FileFormat.AGGREGATED_ALLOCATIONS
+                    if settings.get("memory_format") == "aggregated"
+                    else memray.FileFormat.ALL_ALLOCATIONS
+                ),
             )
             self.tracker.__enter__()
         BaseClient._make_api_call = self.metrics.wrap_call(
@@ -140,6 +145,7 @@ class Instrumentation:
             "pid": self.pid,
             "created": psutil.Process().create_time(),
             "memory": self.tracker is not None,
+            "memory_format": settings.get("memory_format", "all"),
             "started": time.monotonic(),
             "status": "running",
         }

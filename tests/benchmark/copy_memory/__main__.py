@@ -51,6 +51,25 @@ def main() -> None:
     run.add_argument(
         "--baseline-ref", help="Git ref measured next to the current code."
     )
+    run.add_argument("--candidate-ref", help="Pin candidate code to this Git ref.")
+    run.add_argument(
+        "--ab",
+        action="store_true",
+        help="Compare two revisions at one size and version.",
+    )
+    run.add_argument(
+        "--copy-mode",
+        choices=("auto", "memory", "full"),
+        default="auto",
+        help="auto uses memory runs for A/B and overnight; full copies all S3 objects.",
+    )
+    run.add_argument("--repeats", type=int, default=1)
+    run.add_argument(
+        "--cleanup-timeout",
+        type=float,
+        default=1800,
+        help="Maximum seconds waiting for environment removal, outside the work budget.",
+    )
     run.add_argument(
         "--budget-hours",
         type=float,
@@ -65,7 +84,7 @@ def main() -> None:
     run.add_argument(
         "--overnight",
         action="store_true",
-        help="Plan large copies; add small profiler controls and a 10-hour total budget.",
+        help="Plan copies and profile each point under a 10-hour total budget.",
     )
     run.add_argument(
         "--total-budget-hours",
@@ -75,10 +94,13 @@ def main() -> None:
     run.add_argument(
         "--profiles",
         action="store_true",
-        help="Add repeated plain, CPU and memory control runs.",
+        help="After each point, repeat its modes with CPU and memory profiling.",
     )
-    run.add_argument("--profile-parts", type=int, default=50)
-    run.add_argument("--profile-repeats", type=int, default=3)
+    run.add_argument("--profile-repeats", type=int, default=1)
+    run.add_argument("--profile-budget-hours", type=float, default=2)
+    run.add_argument(
+        "--memory-format", choices=("aggregated", "all"), default="aggregated"
+    )
     run.add_argument("--cpu-window", type=int, default=120)
     run.add_argument("--cpu-windows", type=int, default=3)
     run.add_argument("--native-profiles", action="store_true")
@@ -105,7 +127,9 @@ def main() -> None:
         "columns",
         "workers",
         "interval",
-        "profile_parts",
+        "repeats",
+        "cleanup_timeout",
+        "profile_budget_hours",
         "profile_repeats",
         "cpu_window",
         "cpu_windows",
@@ -120,6 +144,12 @@ def main() -> None:
         parser.error("--total-budget-hours must be finite and positive")
     if any(int(parts) <= 0 for parts in args.parts):
         parser.error("--parts must contain positive integers")
+    if args.ab:
+        if not args.baseline_ref or len(args.parts) != 1 or len(args.versions) != 1:
+            parser.error(
+                "--ab requires --baseline-ref, one --parts value and one --versions value"
+            )
+        args.candidate_ref = args.candidate_ref or "HEAD"
     if sys.platform != "linux":
         parser.error(
             "Measurements require Linux; use report to inspect results elsewhere"
@@ -138,6 +168,11 @@ def main() -> None:
         columns=args.columns,
         workers=args.workers,
         baseline_ref=args.baseline_ref,
+        candidate_ref=args.candidate_ref,
+        ab=args.ab,
+        copy_mode=args.copy_mode,
+        repeats=args.repeats,
+        cleanup_timeout=args.cleanup_timeout,
         budget_hours=args.budget_hours,
         freeze_timeout=args.freeze_timeout,
         planning_only_from=args.planning_only_from,
@@ -149,12 +184,13 @@ def main() -> None:
             else 10 if args.overnight else None
         ),
         profiles=args.profiles or args.overnight,
-        profile_parts=args.profile_parts,
         profile_repeats=args.profile_repeats,
+        profile_budget_hours=args.profile_budget_hours,
+        memory_format=args.memory_format,
         cpu_window=args.cpu_window,
         cpu_windows=args.cpu_windows,
         native_profiles=args.native_profiles,
-        trace_python_allocators=args.trace_python_allocators or args.overnight,
+        trace_python_allocators=args.trace_python_allocators,
         tracemalloc=args.tracemalloc,
         min_free_gib=args.min_free_gib,
         max_profile_gib=args.max_profile_gib,

@@ -92,6 +92,192 @@ def test_failed_point_saves_diagnostics_before_cleanup(tmp_path: Path) -> None:
     assert "RuntimeError: failed" in (tmp_path / "report.md").read_text()
 
 
+def test_cleanup_timeout_kills_only_the_client_group(tmp_path: Path) -> None:
+    """Bound compose and its children without killing Docker or deleting unrelated data."""
+    with patch("docker.from_env"):
+        environment = importlib.import_module("tests.benchmark.copy_memory.env")
+    env = Mock(context=Mock(state_file="session.sav"))
+    process = Mock(
+        pid=1234, wait=Mock(side_effect=[subprocess.TimeoutExpired("cleanup", 1), 0])
+    )
+    popen = Mock(return_value=process)
+    with (
+        patch.object(environment.subprocess, "Popen", popen),
+        patch.object(environment.os, "killpg") as kill,
+        patch.object(environment.subprocess, "run") as verify,
+        pytest.raises(environment.CleanupError, match="exceeded"),
+    ):
+        environment.Environment.stop(env, 1, tmp_path / "cleanup.log")
+    assert popen.call_args.kwargs["start_new_session"] is True
+    kill.assert_called_once_with(1234, environment.signal.SIGKILL)
+    verify.assert_not_called()
+
+
+def test_cleanup_failure_stops_series_but_keeps_measurements(tmp_path: Path) -> None:
+    """Do not start another point after timeout, even when measurement succeeded."""
+    with patch("docker.from_env"):
+        driver = importlib.import_module("tests.benchmark.copy_memory.driver")
+    root = tmp_path / "series"
+    benchmark = driver.Driver(
+        driver.Options(parts=[10000, 20000], versions=["26.3"], results=root)
+    )
+
+    def measured(_env, _directory, point, _parts, _started):
+        """Stand in for an already completed set of measured copies."""
+        point.update(status="completed", runs=[{"kind": "fresh", "exit_code": 0}])
+
+    with (
+        patch.object(driver, "Environment") as environment,
+        patch.object(driver, "SESSIONS_DIR", tmp_path / "sessions"),
+        patch.object(benchmark, "_save_system"),
+        patch.object(benchmark, "_measure_point", side_effect=measured) as measure,
+        patch.object(driver.report, "build"),
+    ):
+        environment.return_value.stop.side_effect = driver.CleanupError(
+            "cleanup timed out"
+        )
+        benchmark.run()
+    measure.assert_called_once()
+    assert json.loads((root / "series.json").read_text())["status"] == "cleanup_failed"
+    point = json.loads((root / "26.3/10000/point.json").read_text())
+    assert point["status"] == "completed"
+    assert point["runs"][0]["exit_code"] == 0
+    assert point["cleanup"]["status"] == "failed"
+    assert point["timings"]["cleanup"] >= 0
+    assert (
+        json.loads((root / "26.3/20000/point.json").read_text())["status"]
+        == "skipped_cleanup"
+    )
+
+
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_probe_pins_and_checks_baseline_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mismatch: bool
+) -> None:
+    """Do not silently compare candidate with itself if a baseline import goes wrong."""
+    # pylint: disable=protected-access
+    with patch("docker.from_env"):
+        driver = importlib.import_module("tests.benchmark.copy_memory.driver")
+    monkeypatch.chdir(tmp_path)
+    benchmark = driver.Driver(
+        driver.Options(parts=[10], versions=["26.3"], baseline_ref="old")
+    )
+    benchmark.sources["baseline"] = tmp_path / "sources/baseline"
+    run = driver.Run(
+        "resume", "metadata_only", "metadata", variant="baseline", repeat=2
+    )
+    directory = tmp_path / run.name
+    directory.mkdir()
+    (directory / "summary.json").write_text('{"outcome": "completed"}')
+    (directory / "probe.json").write_text(
+        json.dumps(
+            {
+                "code_root": (
+                    "/code/ch_backup"
+                    if mismatch
+                    else "/code/sources/baseline/ch_backup"
+                ),
+            }
+        )
+    )
+    env = Mock()
+    env.wait_detached.return_value = 0
+    with patch.object(driver, "_oom_events", return_value=[]):
+        result = benchmark._probe(
+            env, tmp_path, run
+        )  # pylint: disable=protected-access
+    command, _directory, variables = env.start_detached.call_args.args
+    assert variables["PYTHONPATH"] == "/code/sources/baseline"
+    assert "--allow-missing" in command
+    env.reset_copy_state.assert_called_once_with("bench_metadata_2_baseline", "bench")
+    assert result["exit_code"] == int(mismatch)
+    assert result["outcome"] == ("source_mismatch" if mismatch else "completed")
+
+
+def test_ab_reuses_backup_and_profiles_after_all_plain_pairs(tmp_path: Path) -> None:
+    """Rotate A/B order while keeping preparation shared and profiles last."""
+    # pylint: disable=protected-access
+    with patch("docker.from_env"):
+        driver = importlib.import_module("tests.benchmark.copy_memory.driver")
+    benchmark = driver.Driver(
+        driver.Options(
+            parts=[10],
+            versions=["26.3"],
+            ab=True,
+            baseline_ref="old",
+            repeats=2,
+            profiles=True,
+        )
+    )
+    point: dict = {"timings": {}, "runs": []}
+    order = []
+
+    def record(_env, _directory, current, run):
+        """Keep real ordering without launching a benchmark process."""
+        order.append((run.kind, run.repeat, run.variant, run.profile))
+        result = {"exit_code": 0, "outcome": "completed"}
+        current["runs"].append(result)
+        return result
+
+    env = Mock()
+    with (
+        patch.object(benchmark, "_configure"),
+        patch.object(benchmark, "_save_environment"),
+        patch.object(benchmark, "_start_collector"),
+        patch.object(benchmark, "_checkpoint"),
+        patch.object(benchmark, "_backup", return_value=1) as backup,
+        patch.object(benchmark, "_run", side_effect=record),
+        patch.object(driver.dataset, "create_table"),
+        patch.object(driver.dataset, "insert_parts", return_value=1),
+        patch.object(driver.dataset, "check_parts"),
+        patch.object(
+            driver.inventory,
+            "collect",
+            return_value={"unique_objects": 100, "metadata_format_version": 5},
+        ),
+    ):
+        benchmark._measure_point(env, tmp_path, point, 10, 0)
+    env.start.assert_called_once()
+    backup.assert_called_once()
+    assert len(order) == 24
+    assert [row[2] for row in order[:12]] == ["baseline", "candidate"] * 3 + [
+        "candidate",
+        "baseline",
+    ] * 3
+    assert all(row[3] is None for row in order[:12])
+    assert all(row[3] for row in order[12:])
+    assert point["status"] == "completed"
+
+
+def test_report_keeps_repeat_directories_separate(tmp_path: Path) -> None:
+    """Read repeated runs from distinct paths while retaining legacy directory names."""
+    point = tmp_path / "26.3/10"
+    point.mkdir(parents=True)
+    runs = []
+    for repeat in (1, 2):
+        run = {
+            "kind": "fresh",
+            "variant": "candidate",
+            "repeat": repeat,
+            "duration": repeat,
+        }
+        directory = point / f"fresh_{repeat}-candidate"
+        directory.mkdir()
+        (directory / "summary.json").write_text(
+            json.dumps({"exit_code": 0, "duration": repeat})
+        )
+        runs.append(run)
+    (point / "point.json").write_text(
+        json.dumps({"version": "26.3", "parts": 10, "runs": runs})
+    )
+    loaded = report.load(tmp_path)[0]["runs"]
+    assert [run["dir"].name for run in loaded] == [
+        "fresh_1-candidate",
+        "fresh_2-candidate",
+    ]
+    assert [run["summary"]["duration"] for run in loaded] == [1, 2]
+
+
 def test_diagnostics_survive_command_timeout(tmp_path: Path) -> None:
     """Try remaining diagnostics if one command times out."""
     with patch("docker.from_env"):

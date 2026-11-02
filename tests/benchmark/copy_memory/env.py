@@ -8,7 +8,9 @@ code, so a long copy survives a broken connection to Docker.
 
 import os
 import shlex
+import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +27,10 @@ PATH_ROOT = "ch_backup"
 
 class CommandError(RuntimeError):
     """A command in the container failed."""
+
+
+class CleanupError(RuntimeError):
+    """Stop the series when its previous environment could not be removed."""
 
 
 class Environment:
@@ -50,9 +56,59 @@ class Environment:
         """Start containers with empty storages."""
         env_control.start(self.context)
 
-    def stop(self) -> None:
-        """Remove containers with their data."""
-        env_control.stop(self.context)
+    def stop(self, timeout: float, log: Path) -> None:
+        """Bound the cleanup client and refuse to reuse an environment left behind."""
+        command = [
+            sys.executable,
+            "-m",
+            "tests.integration.env_control",
+            "stop",
+            "--state-file",
+            self.context.state_file,
+        ]
+        with log.open("w", encoding="utf-8") as output:
+            process = subprocess.Popen(  # pylint: disable=consider-using-with
+                command, stdout=output, stderr=subprocess.STDOUT, start_new_session=True
+            )
+            try:
+                code = process.wait(timeout=timeout)
+            except BaseException as error:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                if isinstance(error, subprocess.TimeoutExpired):
+                    raise CleanupError(
+                        f"Cleanup exceeded {timeout:g}s; Docker may still be removing "
+                        f"containers. See {log} and {self.context.state_file}"
+                    ) from error
+                raise
+        if code:
+            raise CleanupError(f"Cleanup exited with {code}; see {log}")
+        try:
+            remaining = subprocess.run(
+                [
+                    "docker",
+                    "ps",
+                    "-aq",
+                    "--filter",
+                    f"label=ch-backup.integration.environment={self.conf['network_name']}",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError) as error:
+            raise CleanupError(f"Cannot verify cleanup; see {log}") from error
+        if remaining:
+            raise CleanupError(
+                f"Containers remain after cleanup: {remaining}; see {log}"
+            )
 
     @property
     def conf(self) -> dict:
@@ -142,11 +198,11 @@ class Environment:
                 on_poll()
             time.sleep(interval)
 
-    def signal_detached(self, workdir: str, signal: str = "TERM") -> None:
+    def signal_detached(self, workdir: str, signum: str = "TERM") -> None:
         """Send the signal to the detached command."""
         directory = shlex.quote(workdir)
         self.exec(
-            f"test -f {directory}/rc || kill -{signal} $(cat {directory}/pid) "
+            f"test -f {directory}/rc || kill -{signum} $(cat {directory}/pid) "
             f"|| test -f {directory}/rc"
         )
 

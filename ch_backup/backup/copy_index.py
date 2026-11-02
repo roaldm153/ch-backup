@@ -4,7 +4,7 @@ import json
 import sqlite3
 import threading
 import weakref
-from collections.abc import Iterable, Iterator, MutableMapping
+from collections.abc import ItemsView, Iterable, Iterator, MutableMapping, ValuesView
 from contextlib import contextmanager
 from tempfile import NamedTemporaryFile
 from typing import IO, Any, Generic, TypeVar
@@ -81,15 +81,16 @@ class CopyIndex(MutableMapping[K, V], Generic[K, V]):
         """Store a record and commit bounded groups of writes."""
         encoded = _pack_key(key)
         with self._lock:
+            data = self._encode(value)
             cursor = self._db.execute(
                 "INSERT OR IGNORE INTO records VALUES (?, ?)",
-                (encoded, self._encode(value)),
+                (encoded, data),
             )
             self._count += cursor.rowcount
             if not cursor.rowcount:
                 self._db.execute(
                     "UPDATE records SET value=? WHERE key=?",
-                    (self._encode(value), encoded),
+                    (data, encoded),
                 )
             self._writes += 1
             if self._writes >= 512 and not self._importing:
@@ -110,6 +111,14 @@ class CopyIndex(MutableMapping[K, V], Generic[K, V]):
         """Read keys in insertion order."""
         for key, _ in self._rows():
             yield _unpack_key(key)
+
+    def values(self) -> ValuesView[V]:
+        """Read values in batches without looking up each key again."""
+        return _CopyValuesView(self)
+
+    def items(self) -> ItemsView[K, V]:
+        """Read key-value pairs directly from each batch."""
+        return _CopyItemsView(self)
 
     def _rows(self) -> Iterator[tuple[bytes, bytes]]:
         """Release the connection lock between bounded result batches."""
@@ -154,6 +163,30 @@ class CopyIndex(MutableMapping[K, V], Generic[K, V]):
         finally:
             self._importing = False
             self._writes = 0
+
+
+class _CopyValuesView(ValuesView[V]):
+    """Keep the mapping view behavior while scanning stored values directly."""
+
+    _mapping: CopyIndex[Any, V]
+
+    def __iter__(self) -> Iterator[V]:
+        """Decode one value at a time from bounded batches."""
+        # pylint: disable=protected-access
+        for _, value in self._mapping._rows():
+            yield self._mapping._decode(value)
+
+
+class _CopyItemsView(ItemsView[K, V]):
+    """Keep the mapping view behavior while scanning stored records directly."""
+
+    _mapping: CopyIndex[K, V]
+
+    def __iter__(self) -> Iterator[tuple[K, V]]:
+        """Decode key-value pairs in insertion order."""
+        # pylint: disable=protected-access
+        for key, value in self._mapping._rows():
+            yield _unpack_key(key), self._mapping._decode(value)
 
 
 class EntryIndex(CopyIndex[K, CopyEntry]):
