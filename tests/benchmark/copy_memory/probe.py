@@ -11,6 +11,7 @@ __mp_main__, which enables the same optional instrumentation in every worker.
 # pylint: disable=protected-access
 
 import argparse
+import copy
 import hashlib
 import importlib
 import json
@@ -474,9 +475,14 @@ def _without_objects(original: Callable) -> Callable:
     """Wrap copying of objects to upload only rewritten disk metadata."""
 
     @wraps(original)
-    def wrapper(copier: Any, backup: Any, _pending: Any, *args: Any) -> None:
+    def wrapper(copier: Any, backup: Any, pending: Any, *args: Any) -> None:
         """Copy no objects."""
-        original(copier, backup, [], *args)
+        if hasattr(pending, "entries"):
+            pending = copy.copy(pending)
+            pending.entries = []
+        else:
+            pending = []
+        original(copier, backup, pending, *args)
 
     return wrapper
 

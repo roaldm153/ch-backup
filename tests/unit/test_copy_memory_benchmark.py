@@ -14,7 +14,42 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from ch_backup.storage.object_copy import CopyEntry
 from tests.benchmark.copy_memory import dataset, probe, report
+
+
+def test_metadata_only_keeps_rewritten_archives_in_scope_plan() -> None:
+    """Run the current copier with no data objects and the original metadata archives."""
+    # pylint: disable=protected-access
+    module = importlib.import_module(probe.COPIER)
+    plan = module._ScopePlan()
+    plan.entries.append(CopyEntry({}, {}, "source", "target", 1))
+    files = [("part/column.bin", b"metadata")]
+    plan.rewritten_metadata.append(module._RewrittenTarball("metadata.tar", files))
+    copier = Mock(_keep_going=False)
+    copier._resolve_copy_mode.side_effect = lambda entries, _result: iter(entries)
+    backup, result, failures = Mock(), Mock(errors=[]), Mock()
+    probe._without_objects(module.BackupCopier._copy_objects)(
+        copier, backup, plan, result, failures
+    )
+    assert not list(copier._target_layout.copy_objects.call_args.args[0])
+    upload = copier._target_layout.upload_cloud_storage_metadata_files
+    assert upload.call_args.args == (backup, "metadata.tar", files)
+    assert len(plan.entries) == 1
+    assert plan.rewritten_metadata[0].files is files
+
+
+def test_metadata_only_supports_legacy_copy_signature() -> None:
+    """Keep the baseline's separate archives argument when suppressing data objects."""
+    # pylint: disable=protected-access
+    copier, backup, original = Mock(), Mock(), Mock()
+    pending, archives = [object()], [object()]
+    result, failures = Mock(), Mock()
+    probe._without_objects(original)(
+        copier, backup, pending, archives, result, failures
+    )
+    original.assert_called_once_with(copier, backup, [], archives, result, failures)
+    assert len(pending) == 1
 
 
 @pytest.mark.parametrize("exit_code", [0, 7])
