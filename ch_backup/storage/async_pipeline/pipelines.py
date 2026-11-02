@@ -83,7 +83,12 @@ def upload_data_tarball_pipeline(
 
 
 def upload_file_pipeline(
-    config: dict, local_path: Path, remote_path: str, encrypt: bool, delete_after: bool
+    config: dict,
+    local_path: Path,
+    remote_path: str,
+    encrypt: bool,
+    delete_after: bool,
+    compress: bool = False,
 ) -> None:
     """
     Entrypoint of upload file pipeline.
@@ -92,6 +97,8 @@ def upload_file_pipeline(
 
     estimated_size = calc_aligned_files_size([local_path])
     builder.build_read_file_stage(file_path=local_path)
+    if compress:
+        builder.build_compress_stage()
     if encrypt:
         builder.build_encrypt_stage()
         estimated_size = _calc_encrypted_size(config, estimated_size)

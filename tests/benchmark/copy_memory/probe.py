@@ -11,6 +11,7 @@ __mp_main__, which enables the same optional instrumentation in every worker.
 # pylint: disable=protected-access
 
 import argparse
+import hashlib
 import importlib
 import json
 import os
@@ -179,6 +180,14 @@ class Probe:
 
     def start(self) -> None:
         """Start the first segment and the sampler."""
+        package_file = importlib.import_module("ch_backup").__file__
+        if package_file is None:
+            raise RuntimeError("Cannot locate the imported ch-backup package")
+        package = Path(package_file).parent
+        digest = hashlib.sha256()
+        for source in sorted(package.rglob("*.py")):
+            digest.update(str(source.relative_to(package)).encode())
+            digest.update(source.read_bytes())
         if self.trace:
             tracemalloc.start(25)
         self._open_segment()
@@ -188,6 +197,8 @@ class Probe:
                     "pid": os.getpid(),
                     "created": psutil.Process().create_time(),
                     "started": self.started,
+                    "code_root": str(package),
+                    "ch_backup_sha256": digest.hexdigest(),
                 }
             ),
             encoding="utf-8",

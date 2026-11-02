@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from functools import partial
 from io import IOBase
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import (
     Any,
     BinaryIO,
@@ -42,6 +43,11 @@ from ch_backup.encryption import get_encryption_class
 from ch_backup.exceptions import ConfigurationError, StorageError, is_broken_executor
 from ch_backup.storage import StorageLoader
 from ch_backup.storage.engine.s3 import S3RetryingError
+from ch_backup.storage.metadata_archive import (
+    MetadataArchive,
+    MetadataFiles,
+    spool_metadata,
+)
 from ch_backup.storage.object_copy import CopyEntry
 from ch_backup.util import (
     CLOUD_STORAGE_EXCLUDE_FILE_NAMES,
@@ -91,10 +97,13 @@ class BackupLayout:
                 backup.metadata_encrypted = False
                 logging.debug("Saving backup metadata in {}", remote_path)
                 try:
-                    self._storage_loader.upload_data(
-                        backup.dump_json(light=False),
-                        remote_path=remote_path,
-                    )
+                    with NamedTemporaryFile() as metadata:
+                        for chunk in backup.iter_json():
+                            metadata.write(
+                                chunk.encode("utf-8", errors="surrogateescape")
+                            )
+                        metadata.flush()
+                        self._storage_loader.upload_file(metadata.name, remote_path)
                 except Exception:
                     backup.metadata_encrypted = previous_encryption
                     raise
@@ -1041,16 +1050,19 @@ class BackupLayout:
 
     def get_cloud_storage_metadata_files(
         self, backup_meta: BackupMetadata, remote_path: str
-    ) -> list[tuple[str, bytes]]:
+    ) -> MetadataArchive:
         """
         Download tarball with cloud storage metadata and return its files as (file_name, data) pairs.
         """
         try:
-            return self._storage_loader.download_data_tarball(
+            archive = MetadataArchive(downloaded=True)
+            self._storage_loader.download_file(
                 remote_path,
+                archive.path(),
                 encryption=backup_meta.cloud_storage.encrypted,
                 compression=backup_meta.cloud_storage.compressed,
             )
+            return archive
         except Exception as e:
             msg = f'Failed to download tarball file "{remote_path}"'
             raise StorageError(msg) from e
@@ -1059,7 +1071,7 @@ class BackupLayout:
         self,
         backup_meta: BackupMetadata,
         remote_path: str,
-        files: list[tuple[str, bytes]],
+        files: MetadataFiles,
         callback: Callable | None = None,
         on_error: Callable[[BaseException], None] | None = None,
     ) -> None:
@@ -1067,16 +1079,24 @@ class BackupLayout:
         Upload files with cloud storage metadata as a tarball.
         """
         try:
+            archive = (
+                files if isinstance(files, MetadataArchive) else spool_metadata(files)
+            )
             if not backup_meta.cloud_storage.encrypted:
-                self._validate_plaintext_cloud_metadata(files)
-            self._storage_loader.upload_data_tarball(
-                file_names=[file_name for file_name, _ in files],
-                data_list=[data for _, data in files],
+                self._validate_plaintext_cloud_metadata(archive)
+
+            def completed() -> None:
+                """Keep the local archive alive until the worker finishes."""
+                archive.path()
+                if callback:
+                    callback()
+
+            self._storage_loader.upload_metadata_archive(
+                local_path=archive.path(),
                 remote_path=remote_path,
-                is_async=True,
                 encryption=backup_meta.cloud_storage.encrypted,
                 compression=backup_meta.cloud_storage.compressed,
-                callback=callback,
+                callback=completed,
                 on_error=on_error,
             )
         except StorageError:

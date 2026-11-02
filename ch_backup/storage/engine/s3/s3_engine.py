@@ -5,7 +5,7 @@ S3 storage engine.
 import os
 import time
 from tempfile import TemporaryFile
-from typing import Sequence
+from typing import Iterator, Sequence
 
 import requests
 from botocore.exceptions import ClientError
@@ -166,14 +166,15 @@ class S3StorageEngine(PipeLineCompatibleStorageEngine, metaclass=S3RetryMeta):
         """
         Return sizes of all objects under the remote path (recursively) keyed by object key.
         """
+        return dict(self.iter_dir_with_sizes(remote_path))
+
+    def iter_dir_with_sizes(self, remote_path: str) -> Iterator[tuple[str, int]]:
+        """Yield object keys one S3 page at a time."""
         remote_path = remote_path.strip("/") + "/"
-        result = {}
         paginator = self._s3_client.get_paginator("list_objects")
         for page in paginator.paginate(Bucket=self._s3_bucket_name, Prefix=remote_path):
             for file_key in page.get("Contents", []):
-                result[file_key["Key"]] = file_key["Size"]
-
-        return result
+                yield file_key["Key"], file_key["Size"]
 
     def copy_object(
         self, source_bucket: str, source_path: str, remote_path: str

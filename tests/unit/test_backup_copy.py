@@ -58,6 +58,15 @@ class FakeEngine:
             raise StorageError(f"Failed to list {prefix}")
         return {k: v for k, v in self._objects.items() if k.startswith(prefix)}
 
+    def iter_dir_with_sizes(self, remote_path):
+        """Expose the paginated engine contract for the in-memory fixture."""
+        yield from self.list_dir_with_sizes(remote_path).items()
+
+    def download_file(self, remote_path, local_path):
+        """Save an object to the requested scratch file."""
+        with open(local_path, "wb") as output:
+            output.write(self.download_data(remote_path))
+
     def upload_data(self, data: bytes, remote_path: str) -> str:
         self._objects[remote_path] = len(data)
         self._store.data[(self._id, remote_path)] = data

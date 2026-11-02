@@ -31,11 +31,16 @@ def main() -> None:
             backup.get_sanitized_name(), disk, backup.cloud_storage.compressed, "all"
         ):
             files = layout.get_cloud_storage_metadata_files(backup, path)
+            count = unpacked = names = 0
+            for name, data in files:
+                count += 1
+                unpacked += len(data)
+                names += len(name)
             line = {
                 "path": path,
-                "files": len(files),
-                "unpacked": sum(len(data) for _, data in files),
-                "names": sum(len(name) for name, _ in files),
+                "files": count,
+                "unpacked": unpacked,
+                "names": names,
             }
             print(json.dumps(line), flush=True)
 
