@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from types import FrameType
 
-from tests.benchmark.copy_memory import report
+from tests.benchmark.copy_memory import probe, report
 
 
 def _list(value: str) -> list[str]:
@@ -27,7 +27,7 @@ def _terminate(_signum: int, _frame: FrameType | None) -> None:
 
 def main() -> None:
     """Run the benchmark or build the report of its results."""
-    # pylint: disable=too-many-statements
+    # pylint: disable=too-many-statements,too-many-branches
     parser = argparse.ArgumentParser(prog="python -m tests.benchmark.copy_memory")
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="Run points and build the report.")
@@ -52,6 +52,16 @@ def main() -> None:
         "--baseline-ref", help="Git ref measured next to the current code."
     )
     run.add_argument("--candidate-ref", help="Pin candidate code to this Git ref.")
+    run.add_argument(
+        "--sqlite-cache-mib",
+        type=probe.cache_mib,
+        help="Override candidate SQLite cache per index (1-64 MiB).",
+    )
+    run.add_argument(
+        "--baseline-sqlite-cache-mib",
+        type=probe.cache_mib,
+        help="Override baseline SQLite cache per index (1-64 MiB).",
+    )
     run.add_argument(
         "--ab",
         action="store_true",
@@ -121,6 +131,8 @@ def main() -> None:
         return
     if args.freeze_timeout <= 0:
         parser.error("--freeze-timeout must be positive")
+    if args.baseline_sqlite_cache_mib is not None and not args.baseline_ref:
+        parser.error("--baseline-sqlite-cache-mib requires --baseline-ref")
     if not 0 < args.budget_hours < float("inf"):
         parser.error("--budget-hours must be finite and positive")
     for name in (
@@ -169,6 +181,8 @@ def main() -> None:
         workers=args.workers,
         baseline_ref=args.baseline_ref,
         candidate_ref=args.candidate_ref,
+        sqlite_cache_mib=args.sqlite_cache_mib,
+        baseline_sqlite_cache_mib=args.baseline_sqlite_cache_mib,
         ab=args.ab,
         copy_mode=args.copy_mode,
         repeats=args.repeats,

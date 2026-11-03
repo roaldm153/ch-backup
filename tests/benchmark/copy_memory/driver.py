@@ -61,6 +61,8 @@ class Options:
     workers: int = 4
     baseline_ref: str | None = None
     candidate_ref: str | None = None
+    sqlite_cache_mib: int | None = None
+    baseline_sqlite_cache_mib: int | None = None
     ab: bool = False
     copy_mode: str = "auto"
     repeats: int = 1
@@ -633,7 +635,7 @@ class Driver:
         on_update: Callable[[], None] | None = None,
     ) -> dict:
         """Run the copy under the probe and return its outcome."""
-        # pylint: disable=too-many-locals
+        # pylint: disable=too-many-locals,too-many-statements
         host_dir = point_dir / run.name
         workdir = in_container(host_dir)
         if (run.case or run.kind) == "resume":
@@ -646,6 +648,9 @@ class Driver:
                 {"run": run.name, "profile": run.profile},
             )
         command += ["--interval", str(self.options.interval)]
+        cache = self._cache_mib(run.variant)
+        if cache is not None:
+            command += ["--sqlite-cache-mib", str(cache)]
         if run.mode != "full":
             command.append(f"--{run.mode.replace('_', '-')}")
         if run.kind == "tracemalloc":
@@ -753,10 +758,18 @@ class Driver:
             in_container(self.sources[variant]) if variant in self.sources else "/code"
         )
 
+    def _cache_mib(self, variant: str) -> int | None:
+        """Return the cache override for this side of the comparison."""
+        return (
+            self.options.baseline_sqlite_cache_mib
+            if variant == "baseline"
+            else self.options.sqlite_cache_mib
+        )
+
     def _source_result(self, directory: Path, variant: str) -> dict:
-        """Reject successful copies that imported a different revision's package."""
+        """Reject successful copies using the wrong package or an unverified cache."""
+        identity = _read_json(directory / "probe.json") or {}
         if variant in self.sources:
-            identity = _read_json(directory / "probe.json") or {}
             expected = in_container(self.sources[variant] / "ch_backup")
             if identity.get("code_root") != expected:
                 return {
@@ -764,6 +777,17 @@ class Driver:
                     "outcome": "source_mismatch",
                     "source_error": f"Expected {expected}",
                 }
+        cache = self._cache_mib(variant)
+        counters = (_read_json(directory / "summary.json") or {}).get("counters", {})
+        if cache is not None and (
+            identity.get("sqlite_cache_mib") != cache
+            or not counters.get("sqlite_indexes_created")
+        ):
+            return {
+                "exit_code": 1,
+                "outcome": "cache_mismatch",
+                "source_error": f"Expected verified SQLite cache of {cache} MiB",
+            }
         return {}
 
     def _profile_result(

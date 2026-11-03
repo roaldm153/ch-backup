@@ -727,6 +727,12 @@ def _comparison_values(run: dict) -> dict[str, float]:
     total = run.get("sample_stats", {}).get("peak_total_rss")
     if total is not None:
         values["sampled_total_gib"] = total / GIB
+    counters = run.get("summary", {}).get("counters", {})
+    if "sqlite_cache_budget_peak_kib" in counters:
+        values["sqlite_cache_budget_mib"] = (
+            counters["sqlite_cache_budget_peak_kib"] / 1024
+        )
+        values["sqlite_indexes_peak"] = counters["sqlite_indexes_peak"]
     return values
 
 
@@ -742,6 +748,7 @@ def _comparison_lines(points: list[dict]) -> list[str]:
         "Медианы только завершённых пар одинакового сценария и повтора, без тяжёлых профайлеров. "
         "Δ = candidate / baseline − 1; отрицательное значение означает уменьшение. "
         "main/worker — пики по этапам; sampled_total — максимум суммы RSS по выборке. CPU — учтённое время по сегментам.",
+        "sqlite_cache_budget_mib — сумма бюджетов кешей одновременно открытых индексов, не фактически занятая RAM.",
         "",
         "| Версия / парты | Сценарий / режим | Метрика | Пар | Baseline | Candidate | Δ |",
         "|---|---|---|---|---|---|---|",
@@ -826,6 +833,28 @@ def build(root: Path) -> None:
     text = render_markdown(points, structures)
     if (root / "options.json").exists():
         options = json.loads((root / "options.json").read_text(encoding="utf-8"))
+        if any(
+            options.get(key) is not None
+            for key in ("baseline_sqlite_cache_mib", "sqlite_cache_mib")
+        ):
+            caches = [
+                (
+                    f"{side}: {options[key]} МиБ"
+                    if options.get(key) is not None
+                    else f"{side}: из кода"
+                )
+                for side, key in (
+                    ("baseline", "baseline_sqlite_cache_mib"),
+                    ("candidate", "sqlite_cache_mib"),
+                )
+            ]
+            text = text.replace(
+                "# Память ch-backup copy\n",
+                "# Память ch-backup copy\n\nКеш SQLite на индекс: "
+                + "; ".join(caches)
+                + ".\n",
+                1,
+            )
         if options.get("baseline_commit"):
             text = text.replace(
                 "## A/B: baseline → candidate\n",

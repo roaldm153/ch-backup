@@ -649,8 +649,17 @@ def _write_point(root: Path, parts: int, objects: int) -> None:
 def test_report(tmp_path: Path) -> None:
     _write_point(tmp_path, 1000, 300_000)
     _write_point(tmp_path, 3000, 900_000)
+    (tmp_path / "options.json").write_text(
+        json.dumps(
+            {
+                "baseline_sqlite_cache_mib": 2,
+                "sqlite_cache_mib": 64,
+            }
+        )
+    )
 
     report.build(tmp_path)
+    assert "baseline: 2 МиБ; candidate: 64 МиБ" in (tmp_path / "report.md").read_text()
 
     for name in (
         "peak_vs_objects.png",

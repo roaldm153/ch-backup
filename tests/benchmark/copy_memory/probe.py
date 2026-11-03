@@ -16,6 +16,7 @@ import hashlib
 import importlib
 import json
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -30,6 +31,7 @@ import psutil
 COPIER = "ch_backup.backup.copier"
 CONTEXT = "ch_backup.backup.copy_context"
 LAYOUT = "ch_backup.backup.layout"
+INDEX = "ch_backup.backup.copy_index"
 
 STAGES = (
     (COPIER, "BackupCopier", "_select_backups", "select"),
@@ -55,6 +57,7 @@ STAGES = (
 )
 
 HOOKS = (
+    (INDEX, "CopyIndex", "__init__"),
     (COPIER, "_ScopePlan", "__init__"),
     (CONTEXT, "CopyContext", "__init__"),
     (CONTEXT, "CopyContext", "flush"),
@@ -79,6 +82,14 @@ SAMPLE_FIELDS = (
 
 class PlanningDone(BaseException):
     """Stops copying once it is planned, before anything is written to the target storage."""
+
+
+def cache_mib(value: str) -> int:
+    """Accept a bounded SQLite cache size for one experimental connection."""
+    size = int(value)
+    if not 1 <= size <= 64:
+        raise argparse.ArgumentTypeError("SQLite cache must be between 1 and 64 MiB")
+    return size
 
 
 def read_status(pid: int) -> dict[str, int]:
@@ -136,8 +147,20 @@ class Probe:
 
     # pylint: disable=too-many-instance-attributes
     def __init__(
-        self, out: Path, interval: float, trace: bool, strict: bool = True
+        self,
+        out: Path,
+        interval: float,
+        trace: bool,
+        strict: bool = True,
+        sqlite_cache_mib: int | None = None,
     ) -> None:
+        """Track stage measurements and an optional cache experiment."""
+        self.sqlite_cache_mib = (
+            cache_mib(str(sqlite_cache_mib)) if sqlite_cache_mib is not None else None
+        )
+        self.indexes: weakref.WeakValueDictionary[int, Any] = (
+            weakref.WeakValueDictionary()
+        )
         self.out = out
         self.interval = interval
         self.trace = trace
@@ -159,6 +182,10 @@ class Probe:
 
     def install(self, planning_only: bool, metadata_only: bool) -> None:
         """Wrap stage methods and hooks, with switches of the run mode."""
+        if self.sqlite_cache_mib is not None:
+            self._patch(
+                INDEX, "CopyIndex", "__init__", self._index_cache, required=True
+            )
         self._patch(COPIER, "_ScopePlan", "__init__", self._tracker(self.plans))
         self._patch(CONTEXT, "CopyContext", "__init__", self._tracker(self.contexts))
         self._patch(CONTEXT, "CopyContext", "flush", self._flush_counter)
@@ -199,6 +226,8 @@ class Probe:
                     "started": self.started,
                     "code_root": str(package),
                     "ch_backup_sha256": digest.hexdigest(),
+                    "sqlite_version": sqlite3.sqlite_version,
+                    "sqlite_cache_mib": self.sqlite_cache_mib,
                 }
             ),
             encoding="utf-8",
@@ -221,6 +250,7 @@ class Probe:
             "errors": self.errors,
             "counters": self._counters(),
             "python": sys.version,
+            "sqlite_cache_mib": self.sqlite_cache_mib,
         }
         (self.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
@@ -317,6 +347,32 @@ class Probe:
 
         return wrapper
 
+    def _index_cache(self, original: Callable) -> Callable:
+        """Set and verify the cache on every index created by the measured copy."""
+        assert self.sqlite_cache_mib is not None
+        kib = self.sqlite_cache_mib * 1024
+
+        @wraps(original)
+        def wrapper(index: Any, *args: Any, **kwargs: Any) -> None:
+            """Preserve index initialization and change only its page-cache budget."""
+            original(index, *args, **kwargs)
+            index._db.execute(f"PRAGMA cache_size=-{kib}")
+            if index._db.execute("PRAGMA cache_size").fetchone()[0] != -kib:
+                raise RuntimeError("SQLite cache override was not applied")
+            with self.lock:
+                self.indexes[id(index)] = index
+                self.counters["sqlite_indexes_created"] = (
+                    self.counters.get("sqlite_indexes_created", 0) + 1
+                )
+                self.counters["sqlite_indexes_peak"] = max(
+                    self.counters.get("sqlite_indexes_peak", 0), len(self.indexes)
+                )
+                self.counters["sqlite_cache_budget_peak_kib"] = (
+                    self.counters["sqlite_indexes_peak"] * kib
+                )
+
+        return wrapper
+
     def _result_catcher(self, original: Callable) -> Callable:
         """Wrap the transfer of the backup to keep its result for progress."""
 
@@ -340,6 +396,14 @@ class Probe:
         plans = list(self.plans)
         contexts = list(self.contexts)
         result = self.result
+        cache = {}
+        if self.sqlite_cache_mib is not None:
+            cache = {
+                "sqlite_indexes": len(self.indexes),
+                "sqlite_cache_budget_kib": len(self.indexes)
+                * self.sqlite_cache_mib
+                * 1024,
+            }
         return {
             "plan_entries": sum(len(getattr(p, "entries", ())) for p in plans),
             "rewritten_archives": sum(
@@ -355,6 +419,7 @@ class Probe:
             "objects_total": (result.objects_total or 0) if result else 0,
             "objects_skipped": result.objects_skipped if result else 0,
             "objects_copied": result.objects_copied if result else 0,
+            **cache,
             **self.counters,
         }
 
@@ -507,6 +572,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--wait-collector", action="store_true")
     parser.add_argument("--planning-only", action="store_true")
     parser.add_argument("--metadata-only", action="store_true")
+    parser.add_argument("--sqlite-cache-mib", type=cache_mib)
     parser.add_argument(
         "--allow-missing",
         action="store_true",
@@ -525,7 +591,13 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     instrumentation = _instrument()
-    probe = Probe(out, args.interval, args.tracemalloc, strict=not args.allow_missing)
+    probe = Probe(
+        out,
+        args.interval,
+        args.tracemalloc,
+        strict=not args.allow_missing,
+        sqlite_cache_mib=args.sqlite_cache_mib,
+    )
     probe.install(args.planning_only, args.metadata_only)
     cli = importlib.import_module("ch_backup").main
     code, outcome, error = 0, "completed", None
