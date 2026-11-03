@@ -6,6 +6,7 @@ import copy
 import gc
 import gzip
 import json
+from collections import Counter
 from pathlib import Path
 from unittest.mock import patch
 
@@ -91,6 +92,12 @@ def test_entry_index_rejects_cross_part_conflicts_and_keeps_secrets_in_memory() 
     assert len(index) == 1
     with pytest.raises(ClickhouseBackupError):
         _add_cloud_storage_copy_entry(index, first._replace(src_path="source/b"))
+    with pytest.raises(ClickhouseBackupError):
+        _add_cloud_storage_copy_entry(index, first._replace(size=2))
+    other_storage = copy.deepcopy(storage)
+    other_storage["credentials"]["bucket"] = "other"
+    with pytest.raises(ClickhouseBackupError):
+        _add_cloud_storage_copy_entry(index, first._replace(src_storage=other_storage))
     assert index[first.dst_path] == first
     index._db.commit()
     path = Path(index._db.execute("PRAGMA database_list").fetchone()[2])
@@ -114,11 +121,115 @@ def test_plan_and_listing_iterate_in_order_and_roll_back_incomplete_import() -> 
     records[b"old"] = True
     with pytest.raises(ValueError):
         with records.importing():
-            for i in range(1000):
+            for i in range(9000):
                 records[str(i).encode()] = True
             raise ValueError("truncated gzip")
     assert list(records) == [b"old"]
     assert len(records) == 1
+
+
+def test_entry_insert_only_reads_duplicate_keys() -> None:
+    """Avoid lookups for new destinations while preserving the first entry on a duplicate."""
+    index: EntryIndex[str] = EntryIndex()
+    queries: list[str] = []
+    index._db.set_trace_callback(queries.append)
+    first = _entry("first")
+    assert index.get_or_insert("first", first) is first
+    assert index.get_or_insert("last", _entry("last")) == _entry("last")
+    assert not any(query.startswith("SELECT") for query in queries)
+    assert index.get_or_insert("first", first._replace(size=42)) == first
+    assert sum(query.startswith("SELECT") for query in queries) == 1
+    assert len(index) == 2
+    assert list(index.values()) == [first, _entry("last")]
+
+
+@pytest.mark.parametrize("deduplicate", [False, True])
+def test_index_batches_commits(deduplicate: bool) -> None:
+    """Commit larger groups on both write paths while keeping the page cache bounded."""
+    index: EntryIndex[int] = EntryIndex()
+    statements: Counter[str] = Counter()
+
+    def count_statement(statement: str) -> None:
+        """Count operations without retaining their keys and values."""
+        statements[statement.split()[0]] += 1
+
+    index._db.set_trace_callback(count_statement)
+    for number in range(8193):
+        if deduplicate:
+            index.get_or_insert(number, _entry(str(number)))
+        else:
+            index[number] = _entry(str(number))
+    assert statements["COMMIT"] == 1
+    assert len(index) == 8193
+    assert index[8192] == _entry("8192")
+    assert index._db.execute("PRAGMA cache_size").fetchone()[0] == -2048
+    assert index._db.execute("PRAGMA mmap_size").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("keep_every", [0, 1, 2, 299])
+@pytest.mark.parametrize("size", [0, 300])
+def test_filtered_plan_preserves_source_and_order(keep_every: int, size: int) -> None:
+    """Filter multiple segments without rewriting entries or losing the full manifest."""
+    original = [_entry(str(i)) for i in range(size)]
+    source = CopyEntries(original[:150])
+    extra: EntryIndex[str] = EntryIndex()
+    for entry in original[150:]:
+        extra[entry.dst_path] = entry
+    source.extend_index(extra)
+    with patch.object(
+        EntryIndex, "_encode", side_effect=AssertionError("rewrote plan")
+    ):
+        selected = source.filtered(
+            lambda entry: bool(keep_every)
+            and int(entry.src_path.split("/")[-1]) % keep_every == 0
+        )
+    expected = original[::keep_every] if keep_every else []
+    assert len(selected) == len(expected)
+    assert list(selected) == list(selected) == expected
+    assert list(source) == original
+    source.append(_entry("appended later"))
+    assert list(selected) == expected
+    del source
+    gc.collect()
+    for entry in selected:
+        assert entry.src_storage is STORAGE
+    selected.append(_entry("new"))
+    assert list(selected) == expected + [_entry("new")]
+    assert list(selected.filtered(lambda entry: entry.src_path == "src/new")) == [
+        _entry("new")
+    ]
+
+
+def test_fully_confirmed_plan_does_not_scan_source_again() -> None:
+    """Store one range and skip reading the plan when all objects are confirmed."""
+    source = CopyEntries(_entry(str(i)) for i in range(300))
+    with patch.object(
+        CopyIndex, "__setitem__", autospec=True, side_effect=CopyIndex.__setitem__
+    ) as store:
+        selected = source.filtered(lambda _item: False)
+    assert store.call_count == 1
+    queries: list[str] = []
+    source._index._db.set_trace_callback(queries.append)
+    assert not selected
+    assert not list(selected)
+    assert not queries
+
+
+def test_failed_filter_leaves_original_plan_unchanged() -> None:
+    """Preserve the full plan if confirmation checking fails partway through."""
+    original = [_entry(str(i)) for i in range(300)]
+    source = CopyEntries(original)
+
+    def keep(entry: CopyEntry) -> bool:
+        """Fail after excluding one batch of entries."""
+        if entry.src_path == "src/150":
+            raise StorageError("confirmation failed")
+        return entry.src_path == "src/128"
+
+    with pytest.raises(StorageError):
+        source.filtered(keep)
+    assert len(source) == 300
+    assert list(source) == original
 
 
 @pytest.mark.parametrize("view_name", ["values", "items"])
@@ -201,7 +312,7 @@ def test_corrupt_journal_does_not_confirm_its_readable_prefix() -> None:
     """Skip all records from a gzip whose trailer fails validation."""
     engine = MemoryEngine()
     context = _context(engine)
-    for i in range(1000):
+    for i in range(9000):
         context.record(_entry(str(i)))
     context.flush(force=True)
     path = next(iter(engine.objects))

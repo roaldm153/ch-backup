@@ -1549,16 +1549,17 @@ class BackupCopier:
             return
         listing = self._list_target_objects(backup, plan)
         target_id = storage_id(self._target_storage)
+
+        def pending(entry: CopyEntry, sizes: CopyIndex[tuple, int] = listing) -> bool:
+            """Keep objects unless both their target size and journal record match."""
+            return sizes.get(
+                (storage_id(entry.dst_storage), _key(entry.dst_path))
+            ) != entry.size or not context.is_recorded(entry)
+
         for scope, scope_plan in plan.items():
             if scope in self._scopes and not self._copy_config["resume"]:
                 continue
-            scope_plan.entries = CopyEntries(
-                entry
-                for entry in scope_plan.entries
-                if listing.get((storage_id(entry.dst_storage), _key(entry.dst_path)))
-                != entry.size
-                or not context.is_recorded(entry)
-            )
+            scope_plan.entries = scope_plan.entries.filtered(pending)
             scope_plan.rewritten_metadata = [
                 _RewrittenTarball(path, files)
                 for path, files in scope_plan.rewritten_metadata
@@ -1569,7 +1570,7 @@ class BackupCopier:
                     listing.get((target_id, _key(path))),
                 )
             ]
-        del listing
+        del listing, pending
         context.forget()
         total = result.objects_total or 0
         result.objects_skipped = total - sum(
@@ -1949,7 +1950,12 @@ def _validate_relative_key(key: str) -> None:
 def _add_cloud_storage_copy_entry(
     entries: MutableMapping[str, CopyEntry], entry: CopyEntry
 ) -> None:
-    planned = entries.setdefault(entry.dst_path, entry)
+    """Deduplicate object destinations and reject conflicting sources or sizes."""
+    planned = (
+        entries.get_or_insert(entry.dst_path, entry)
+        if isinstance(entries, EntryIndex)
+        else entries.setdefault(entry.dst_path, entry)
+    )
     if (storage_id(planned.src_storage), planned.src_path, planned.size) != (
         storage_id(entry.src_storage),
         entry.src_path,

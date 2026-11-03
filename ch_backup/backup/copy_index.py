@@ -4,8 +4,16 @@ import json
 import sqlite3
 import threading
 import weakref
-from collections.abc import ItemsView, Iterable, Iterator, MutableMapping, ValuesView
+from collections.abc import (
+    Callable,
+    ItemsView,
+    Iterable,
+    Iterator,
+    MutableMapping,
+    ValuesView,
+)
 from contextlib import contextmanager
+from itertools import islice
 from tempfile import NamedTemporaryFile
 from typing import IO, Any, Generic, TypeVar
 
@@ -13,6 +21,8 @@ from ch_backup.storage.object_copy import CopyEntry
 
 K = TypeVar("K")
 V = TypeVar("V")
+
+_COMMIT_BATCH_SIZE = 8192
 
 
 def _close_index(connection: sqlite3.Connection, file: IO[bytes]) -> None:
@@ -92,10 +102,14 @@ class CopyIndex(MutableMapping[K, V], Generic[K, V]):
                     "UPDATE records SET value=? WHERE key=?",
                     (data, encoded),
                 )
-            self._writes += 1
-            if self._writes >= 512 and not self._importing:
-                self._db.commit()
-                self._writes = 0
+            self._written()
+
+    def _written(self) -> None:
+        """Commit groups of writes without accumulating records in Python."""
+        self._writes += 1
+        if self._writes >= _COMMIT_BATCH_SIZE and not self._importing:
+            self._db.commit()
+            self._writes = 0
 
     def __delitem__(self, key: K) -> None:
         """Remove one record."""
@@ -224,6 +238,19 @@ class EntryIndex(CopyIndex[K, CopyEntry]):
         source, target, *fields = json.loads(value)
         return CopyEntry(self._storages[source], self._storages[target], *fields)
 
+    def get_or_insert(self, key: K, entry: CopyEntry) -> CopyEntry:
+        """Read the existing entry only when its key is already present."""
+        with self._lock:
+            cursor = self._db.execute(
+                "INSERT OR IGNORE INTO records VALUES (?, ?)",
+                (_pack_key(key), self._encode(entry)),
+            )
+            if cursor.rowcount:
+                self._count += 1
+                self._written()
+                return entry
+            return self[key]
+
 
 class CopyEntries:
     """Keep an ordered plan on disk and expose only one batch at a time."""
@@ -231,7 +258,7 @@ class CopyEntries:
     def __init__(self, entries: Iterable[CopyEntry] = ()) -> None:
         """Append initial entries without collecting the iterable."""
         self._index: EntryIndex[int] = EntryIndex()
-        self._segments: list[EntryIndex] = [self._index]
+        self._segments: list[EntryIndex | _FilteredEntries] = [self._index]
         self.extend(entries)
 
     def append(self, entry: CopyEntry) -> None:
@@ -246,9 +273,28 @@ class CopyEntries:
         for entry in entries:
             self.append(entry)
 
-    def extend_index(self, entries: EntryIndex) -> None:
-        """Reuse a planned object index without serializing every entry again."""
+    def extend_index(self, entries: "EntryIndex | _FilteredEntries") -> None:
+        """Reuse stored entries without serializing them again."""
         self._segments.append(entries)
+
+    def filtered(self, keep: Callable[[CopyEntry], bool]) -> "CopyEntries":
+        """Index excluded ranges without rewriting or mutating the source plan."""
+        excluded: CopyIndex[int, int] = CopyIndex()
+        start = None
+        removed = 0
+        for position, entry in enumerate(self):
+            if not keep(entry):
+                removed += 1
+                if start is None:
+                    start = position
+            elif start is not None:
+                excluded[start] = position
+                start = None
+        if start is not None:
+            excluded[start] = len(self)
+        result = CopyEntries()
+        result.extend_index(_FilteredEntries(self, excluded, removed))
+        return result
 
     def __len__(self) -> int:
         """Return the number of planned objects."""
@@ -258,3 +304,36 @@ class CopyEntries:
         """Read bounded batches from the plan."""
         for segment in self._segments:
             yield from segment.values()
+
+
+class _FilteredEntries:
+    """Read the original plan alongside sorted excluded ranges."""
+
+    def __init__(
+        self, source: CopyEntries, excluded: CopyIndex[int, int], removed: int
+    ) -> None:
+        """Keep the source alive and freeze the number of entries being filtered."""
+        self._source = source
+        self._excluded = excluded
+        self._size = len(source)
+        self._count = self._size - removed
+
+    def __len__(self) -> int:
+        """Return the remaining count without scanning either index."""
+        return self._count
+
+    def values(self) -> Iterator[CopyEntry]:
+        """Merge two bounded streams without querying the index for each object."""
+        if not self:
+            return
+        source = islice(self._source, self._size)
+        if not self._excluded:
+            yield from source
+            return
+        ranges = iter(self._excluded.items())
+        start, end = next(ranges, (self._size, self._size))
+        for position, entry in enumerate(source):
+            if position >= end:
+                start, end = next(ranges, (self._size, self._size))
+            if position < start:
+                yield entry
