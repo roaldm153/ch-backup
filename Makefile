@@ -8,6 +8,14 @@ export DEV_MODE ?= false
 export INTEGRATION_JOBS ?= 3
 export INTEGRATION_FEATURESET ?= tests/integration/ch_backup.featureset
 
+export BENCH_PARTS ?= 1000,3000,10000
+export CLICKHOUSE_VERSIONS ?= 25.8.23.13,26.3.12.3
+export BENCH_COLUMNS ?= 120
+export BENCH_WORKERS ?= 4
+export BASELINE_REF ?=
+export CANDIDATE_REF ?= HEAD
+export BENCH_REPEATS ?= 3
+
 export BUILD_PYTHON_OUTPUT_DIR ?= dist
 export BUILD_DEB_OUTPUT_DIR ?= out
 
@@ -111,6 +119,29 @@ test-integration: create-test-env
 .PHONY: test-integration-parallel
 test-integration-parallel: check-docker-compose build
 	uv run python -m tests.integration.parallel
+
+
+.PHONY: test-benchmark-copy-memory
+test-benchmark-copy-memory: check-docker-compose build
+	uv run --group benchmark python -m tests.benchmark.copy_memory run \
+	    --parts $(BENCH_PARTS) \
+	    --versions $(CLICKHOUSE_VERSIONS) \
+	    --columns $(BENCH_COLUMNS) \
+	    --workers $(BENCH_WORKERS) \
+	    $(if $(BASELINE_REF),--baseline-ref $(BASELINE_REF)) \
+	    $(BENCH_ARGS)
+
+.PHONY: test-benchmark-copy-memory-overnight
+test-benchmark-copy-memory-overnight: BENCH_PARTS = 10000,20000,30000
+test-benchmark-copy-memory-overnight: CLICKHOUSE_VERSIONS = 26.3.12.3
+test-benchmark-copy-memory-overnight: override BENCH_ARGS += --overnight
+test-benchmark-copy-memory-overnight: test-benchmark-copy-memory
+
+.PHONY: test-benchmark-copy-memory-ab
+test-benchmark-copy-memory-ab: BENCH_PARTS = 10000
+test-benchmark-copy-memory-ab: CLICKHOUSE_VERSIONS = 26.3.12.3
+test-benchmark-copy-memory-ab: override BENCH_ARGS += --ab --candidate-ref $(CANDIDATE_REF) --repeats $(BENCH_REPEATS) --profiles
+test-benchmark-copy-memory-ab: test-benchmark-copy-memory
 
 
 .PHONY: clean
@@ -251,3 +282,7 @@ help:
 	@echo "  CLICKHOUSE_VERSION         ClickHouse version to use in integration tests (default: \"$(CLICKHOUSE_VERSION)\")."
 	@echo "  INTEGRATION_JOBS           Slot budget for test-integration-parallel (default: $(INTEGRATION_JOBS))."
 	@echo "  INTEGRATION_FEATURESET     Canonical feature list for parallel runs."
+
+.PHONY: test-benchmark-restore
+test-benchmark-restore: check-docker-compose build
+	uv run --group benchmark python -m tests.benchmark.restore $(BENCH_ARGS)
