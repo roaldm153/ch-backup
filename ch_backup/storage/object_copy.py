@@ -53,6 +53,7 @@ class CopyEntry(NamedTuple):
     encrypt: bool = False
     decrypt: bool = False
     backup_encryption: bool = False
+    external: bool = False
 
 
 def storage_id(storage: dict) -> tuple:

@@ -727,8 +727,8 @@ class BackupLayout:
         path = os.path.join(
             self.get_cloud_storage_path(backup_name), CLOUD_STORAGE_OWNER_FNAME
         ).lstrip("/")
-        self._storage_loader.claim_object(
-            path, json.dumps({"version": 1, "backup_name": backup_name}).encode()
+        self._storage_loader.upload_data(
+            json.dumps({"version": 1, "backup_name": backup_name}), remote_path=path
         )
 
     def get_cloud_storage_backup(self, backup_name: str) -> CloudStorageBackup | None:

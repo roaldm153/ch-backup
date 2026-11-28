@@ -54,6 +54,14 @@ class CopyIndex:
         """Check whether an address exists."""
         return self.get(key) is not None
 
+    def contains_prefix(self, prefix: str) -> bool:
+        """Check whether an indexed path starts with this literal prefix."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT key FROM records WHERE key >= ? ORDER BY key LIMIT 1", (prefix,)
+            ).fetchone()
+        return row is not None and row[0].startswith(prefix)
+
     def put(self, key: str, value: bytes) -> None:
         """Store a blob without changing its insertion position on updates."""
         with self._lock:

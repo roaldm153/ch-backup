@@ -371,10 +371,10 @@ Behavior and limitations:
   or pass `--target-config-parameter copy.reencrypt true`. Use NaCl on both sides
   with different keys, the same chunk size and the same compression type. The
   target's cloud data encryption must use the target backup key, type and chunk size.
-  Export encrypts plaintext files and reencrypts encrypted files, including data
-  materialized from linked parts. An export rejects already encrypted cold objects
-  and detached parts on object-storage disks. The storage service must support conditional PUTs for ownership records.
-  Older botocore versions send the same signed conditional header.
+  Export requires an encrypted source backup and encrypted local, linked and detached parts.
+  Disk metadata archives retain their own source encryption flag. Cold data objects are
+  encrypted with the target key. Already encrypted cold objects and detached parts on
+  object-storage disks are unsupported.
 - For a staged export, run `--scope files` first. After it succeeds, the original
   backup files and source backup key are no longer needed by this export.
   Keep the original disk objects and their read credentials until
@@ -402,12 +402,11 @@ Behavior and limitations:
   a signal. The next run skips an object only if the context records it with the
   same source, target and size and the target storage still holds it with that size: size alone does not
   establish that the contents are correct, and a failed or partial delete may have removed recorded
-  objects. Other objects are overwritten. If the target listing or a context file cannot be read, the
-  affected objects are copied again. `objects_skipped` in the report counts skipped objects. Before
+  objects. Other primary backup objects are copied again. Reusing a nonempty external cold prefix
+  requires a readable journal and listing to verify its contents. `objects_skipped` in the report counts skipped objects. Before
   copying, resuming holds the listing of the target backup in memory, comparable to the object plan.
-  `--no-resume` (or `copy.resume: false`) ignores records of previous runs and overwrites all objects;
-  the run still records confirmed copies, so an interrupted run should be repeated with `--no-resume`
-  to overwrite every object.
+  `--no-resume` (or `copy.resume: false`) transfers every planned object in the selected scopes.
+  The check for an occupied cold prefix still applies, and successful transfers are journaled.
   The context is not copied with the backup and is deleted together with it.
   Completed backups are skipped.
   When a linked part has already been materialized in a successfully copied backup, subsequent
@@ -466,13 +465,10 @@ Behavior and limitations:
 - Copy acquires the configured source and target locks through completion, including retries and
   failure cleanup. To coordinate copy with delete and purge across processes, enable `lock.zk_flock`
   and use the same ZooKeeper ensemble and lock path for every operation on the respective storage.
-  Copies under the same OS account and temporary directory also exclude concurrent local writes
-  to the same destination prefix. When hosts or workers can share a cold prefix, configure the
-  same ZooKeeper lock for those writers, including ordinary copies and exports across different
-  backup roots. Both copy modes reserve the cold prefix using its S3 directory object
-  (the key ending in `/`). It identifies the owning backup repository and backup path.
-  Deleting and recreating a backup at the same location can reuse its prefix. For a different
-  owner, or a nonempty legacy prefix without verifiable ownership, choose a fresh cold prefix.
+  Serialize writers that share a destination, including cold buckets shared by multiple backup
+  repositories. A new copy requires an empty cold prefix. When retrying, each existing cold
+  object must match its journaled location, size and S3 version (or ETag and last-modified
+  time in an unversioned bucket). Choose an empty cold prefix if a revision is missing or differs.
 - Set `multiprocessing.metadata_read_threads` in the target configuration to control parallel
   source and target light-metadata reads at copy startup (default: `4`, positive integer).
   Each batch holds at most this many reads; set `1` for sequential reading.
@@ -541,12 +537,8 @@ Behavior and limitations:
   endpoint, bucket and credentials; disks without static credentials use the storage SDK's
   normal environment/provider chain. Overriding the staging endpoint or bucket requires both
   `access_key_id` and `secret_access_key`. The staging path is exclusive to one restore and must
-  not overlap any source prefix in the same bucket. Restore workers keep an ownership token in
-  `clickhouse.tmp_path/decryption-staging/`. The next restore using the same local state and
-  staging location removes plaintext left by a crashed worker under its owned prefix. Keep this
-  local state between runs. Use a dedicated staging bucket that has never had versioning enabled.
-  Staging credentials need `s3:GetBucketVersioning`, `s3:ListBucketMultipartUploads` and
-  `s3:AbortMultipartUpload` to reclaim incomplete plaintext uploads. Other workers' prefixes remain isolated. Reserve staging capacity for the full restored cloud-storage
+  not overlap the encrypted source prefix in the same bucket, because ch-backup removes everything
+  below it before and after restore. Reserve staging capacity for the full restored cloud-storage
   data volume. Decryption and downloading disk metadata a second time make this restore slower than
   an unencrypted cloud-data restore.
   To use a separate worker, provide source endpoint, bucket, path and credentials explicitly;

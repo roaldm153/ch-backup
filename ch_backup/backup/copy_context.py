@@ -153,22 +153,43 @@ class CopyContext:
                             self._recorded.importing(),
                         ):
                             for line in _journal_lines(stream):
-                                self._recorded.put(_digest(line).hex(), b"")
+                                self._index_record(line)
                 except Exception as e:
                     logging.warning(
                         "Skipping unreadable copy context file {}: {}", path, e
                     )
-        logging.info(
-            "Read {} records of copy context {}", len(self._recorded), self._path
+        logging.info("Read copy context {}", self._path)
+
+    def _index_record(self, line: bytes) -> None:
+        """Keep cold transfers bound to a revision until storage confirms it."""
+        if not line.startswith(b"{"):
+            self._recorded.put(_digest(line).hex(), b"")
+            return
+        receipt = json.loads(line)
+        transfer = receipt["transfer"]
+        storage, key, size = transfer[2:5]
+        destination = _destination_key(storage, key, size, receipt["revision"])
+        self._recorded.put(
+            destination, _digest(json.dumps(transfer, sort_keys=True).encode())
         )
 
-    def is_recorded(self, entry: CopyEntry) -> bool:
-        """Check that copying of the object was confirmed by a previous run."""
-        return self._recorded.contains(
-            _digest(
-                _record(entry, self._data_encryption, self._backup_encryption)
-            ).hex()
+    def confirm_revision(
+        self, storage: dict, path: str, size: int, revision: str
+    ) -> bool:
+        """Authorize the journaled transfer that wrote this cold object revision."""
+        transfer = self._recorded.get(
+            _destination_key(storage_id(storage), path, size, revision)
         )
+        if transfer is None:
+            return False
+        self._recorded.put("cold:" + transfer.hex(), b"")
+        return True
+
+    def is_recorded(self, entry: CopyEntry) -> bool:
+        """Check that the exact transfer was confirmed for the current object."""
+        record = _record(entry, self._data_encryption, self._backup_encryption)
+        prefix = "cold:" if entry.external else ""
+        return self._recorded.contains(prefix + _digest(record).hex())
 
     def is_archive_recorded(
         self, storage: dict, path: str, files: MetadataFiles, size: int | None
@@ -182,11 +203,12 @@ class CopyContext:
         """Drop records of previous runs once the plan is checked against them."""
         self._recorded.clear()
 
-    def record(self, entry: CopyEntry) -> None:
-        """Remember the confirmed copy until the next flush."""
-        self._buffer.append(
-            _record(entry, self._data_encryption, self._backup_encryption).decode()
-        )
+    def record(self, entry: CopyEntry, revision: str | None = None) -> None:
+        """Remember the confirmed transfer and the revision of external data."""
+        record = _record(entry, self._data_encryption, self._backup_encryption).decode()
+        if revision is not None:
+            record = json.dumps({"revision": revision, "transfer": json.loads(record)})
+        self._buffer.append(record)
 
     def record_archive(
         self, storage: dict, path: str, files: MetadataFiles, size: int
@@ -394,6 +416,11 @@ def _archive_record(
         content.update(json.dumps([name, len(data)]).encode())
         content.update(data)
     return json.dumps([storage_id(storage), path, size, content.hexdigest()]).encode()
+
+
+def _destination_key(storage: list | tuple, path: str, size: int, revision: str) -> str:
+    """Index the output of a journaled transfer separately from its exact resume record."""
+    return "dst:" + _digest(json.dumps([storage, path, size, revision]).encode()).hex()
 
 
 def _digest(record: bytes) -> bytes:

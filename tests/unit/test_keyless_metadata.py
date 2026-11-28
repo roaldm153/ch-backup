@@ -346,10 +346,9 @@ def test_restore_decryption_planning_skips_empty_metadata_members() -> None:
             "get_cloud_storage_metadata_remote_paths",
             return_value=["table.tar"],
         ),
-        patch("ch_backup.backup.cloud_storage_decryption.get_storage_engine") as engine,
+        patch.object(CloudStorageDecryption, "_cleanup_prefix"),
         patch.object(CloudStorageDecryption, "_decrypt_entries") as decrypt,
     ):
-        engine.return_value.path_exists.return_value = False
         decryption = CloudStorageDecryption(DEFAULT_CONFIG, layout)
         decryption.decrypt(
             make_backup(), "s3", "all", storage, "data", storage, "staging"

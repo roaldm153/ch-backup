@@ -8,6 +8,7 @@ import copy
 import gzip
 import json
 import os
+import uuid
 from concurrent.futures import BrokenExecutor
 from functools import partial
 from pathlib import Path
@@ -88,21 +89,11 @@ class FakeEngine:
         page = entries[:128]
         return page, page[-1][0] if len(entries) > 128 else None
 
-    def path_exists(self, path: str) -> bool:
-        """Look up a stored key."""
-        return path in self._objects
-
-    def get_object_size(self, path: str) -> int:
-        """Return the stored size used when checking ownership records."""
-        return self._objects[path]
-
-    def claim_object(self, path: str, data: bytes) -> None:
-        """Match the conditional create semantics of S3."""
-        if self.path_exists(path):
-            if self.download_data(path) != data:
-                raise StorageError(f"Conflicting copy parameters for {path}")
-        else:
-            self.upload_data(data, path)
+    def get_object_revision(self, remote_path: str, size: int) -> str:
+        """Return the revision of the most recent fixture write."""
+        if self._objects.get(remote_path, size) != size:
+            raise StorageError(f'Copy destination "{remote_path}" changed size')
+        return self._store.revisions.get((self._id, remote_path), "untracked")
 
     def download_file(self, remote_path, local_path):
         """Save an object to the requested scratch file."""
@@ -129,6 +120,8 @@ class FakeEngine:
         self, source_bucket: str, source_path: str, remote_path: str
     ) -> bool:
         self._store.probes.append((source_bucket, source_path, remote_path))
+        if self._store.server_side_copy_available:
+            self._store.revisions[self._id, remote_path] = uuid.uuid4().hex
         return self._store.server_side_copy_available
 
 
@@ -139,6 +132,7 @@ class FakeStore:
 
     def __init__(self) -> None:
         self.buckets: dict[tuple, dict[str, int]] = {}
+        self.revisions: dict[tuple, str] = {}
         self.probes: list[tuple] = []
         self.server_side_copy_available = True
         self.data: dict[tuple, bytes] = {}
@@ -175,6 +169,7 @@ class FakeLayout:
         self.copy_error: Exception | None = None
         self.object_errors: dict[str, BaseException] = {}
         self.metadata_errors: dict[str, Exception] = {}
+        self._revisions = store.revisions
         self._storage_loader = store.engine(config["storage"])
         self._encryption_chunk_size = config["encryption"]["chunk_size"]
         self._encryption_metadata_size = get_encryption_class(
@@ -250,6 +245,9 @@ class FakeLayout:
                 if not keep_going:
                     raise error
             else:
+                self._revisions[storage_id(entry.dst_storage), entry.dst_path] = (
+                    uuid.uuid4().hex
+                )
                 self.copied.append(entry)
                 self._copy_content(entry)
                 if self.store:
@@ -3882,28 +3880,28 @@ def test_export_can_change_an_occupied_cold_destination() -> None:
     assert "fresh/b1/xyz/aaa" in cold
 
 
-@pytest.mark.parametrize("first_export", [True, False])
-def test_only_one_mode_can_write_after_both_plan(first_export: bool) -> None:
-    """A competing copy planning against the same empty target loses the reservation."""
-    ctx = CopyTestContext([_backup("b1")])
+def test_ordinary_copy_cannot_overwrite_another_exports_cold_objects() -> None:
+    """Keep the published export readable when a second repository uses the same cold prefix."""
+    ctx = _cloud_storage_context()
+    ctx.target_layout.store = ctx.store
+    ctx.target_config["copy"]["reencrypt"] = True
+    ctx.target_config["encryption"]["key"] = "b" * 32
     _with_files(ctx, "b1", {"metadata/databases.tar": 100, "metadata/db1.tar": 100})
-    transfer = BackupCopier._transfer_backup  # pylint: disable=protected-access
-    modes = ctx.target_config["copy"]
+    ctx.copy(["b1"])
+    cold = ctx.store.bucket("disk-copy")
+    original = cold.copy()
+    assert original["copies/b1/xyz/aaa"] > 1000
 
-    def start_competitor(copier, *args, **kwargs):
-        modes["reencrypt"] = not first_export
-        ctx.target_config["encryption"]["key"] = "k" * 32 if first_export else "b" * 32
-        with patch.object(BackupCopier, "_transfer_backup", transfer):
-            with pytest.raises(StorageError, match="Conflicting copy parameters"):
-                ctx.copy(["b1"])
-        assert not ctx.target_layout.uploaded
-        return transfer(copier, *args, **kwargs)
-
-    modes["reencrypt"] = first_export
-    ctx.target_config["encryption"]["key"] = "b" * 32 if first_export else "k" * 32
-    with patch.object(BackupCopier, "_transfer_backup", start_competitor):
-        assert ctx.copy(["b1"]) == (["b1"], [])
-    assert ctx.target_layout.backups["b1"].copy_reencrypted is first_export
+    ctx.target_config["storage"]["credentials"]["bucket"] = "other-backups"
+    ctx.target_config["copy"]["reencrypt"] = False
+    ctx.target_config["encryption"]["key"] = ctx.config["encryption"]["key"]
+    ctx.target_layout = FakeLayout("ch_backup_copy", [], ctx.store, ctx.target_config)
+    ctx.target_layout.source = ctx.layout
+    ctx.target_layout.store = ctx.store
+    with pytest.raises(ClickhouseBackupError, match="already contains data"):
+        ctx.copy(["b1"])
+    assert cold == original
+    assert not ctx.target_layout.uploaded
 
 
 @pytest.mark.parametrize("damage", ["manifest", "file", None])

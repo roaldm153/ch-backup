@@ -464,9 +464,6 @@ class ClickHouseTemporaryDisks(ClickHouseDiskManager):
                 source_path,
                 self._disks[disk_name],
             )
-            staging_path = self._decryption.allocate_staging(
-                staging_storage, staging_path
-            )
             self._decryption.decrypt(
                 backup_meta,
                 disk_name,

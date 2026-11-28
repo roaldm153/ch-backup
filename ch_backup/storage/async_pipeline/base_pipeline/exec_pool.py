@@ -60,8 +60,10 @@ class ExecPool:
         """
         if self._shutdown:
             return
-        self._pool.shutdown(wait=graceful, cancel_futures=True)
-        self._shutdown = True
+        try:
+            self._pool.shutdown(wait=graceful, cancel_futures=True)
+        finally:
+            self._shutdown = True
 
     def submit(
         self,

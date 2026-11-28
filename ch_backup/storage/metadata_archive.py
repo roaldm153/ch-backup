@@ -8,7 +8,7 @@ import weakref
 from contextlib import closing
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import IO, Iterable
+from typing import IO, Iterable, Iterator
 
 from ch_backup.storage.async_pipeline.stages.filesystem.read_files_tarball_stage import (
     _make_tar_header,
@@ -136,6 +136,15 @@ class TemporaryMetadataArchive:
             except (tarfile.HeaderError, tarfile.ReadError) as error:
                 raise ValueError("Truncated TAR stream") from error
             return files, position if position < size else None
+
+    def iter_files(self) -> Iterator[tuple[str, bytes]]:
+        """Read archive members in bounded batches."""
+        continuation = None
+        while True:
+            files, continuation = self.read_batch(continuation)
+            yield from files
+            if continuation is None:
+                return
 
     def count_files(self) -> int:
         """Count nonempty files, scanning downloaded archives once."""

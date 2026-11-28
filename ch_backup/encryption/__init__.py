@@ -66,6 +66,22 @@ def get_cloud_storage_data_encryption_metadata(config: dict) -> dict[str, Any]:
     }
 
 
+def _encryption_mismatch(config: dict, metadata: Mapping[str, Any]) -> str | None:
+    """Return the first encryption setting that differs from the recorded identity."""
+    expected = get_cloud_storage_data_encryption_metadata(config)
+    for field in ("version", "type", "chunk_size"):
+        if metadata.get(field) != expected[field]:
+            return field
+    key_id = metadata.get("key_id")
+    if (
+        not isinstance(key_id, str)
+        or not key_id.isascii()
+        or not hmac.compare_digest(key_id, expected["key_id"])
+    ):
+        return "key"
+    return None
+
+
 def validate_export_encryption(
     config: Config | dict, metadata: Mapping[str, Any]
 ) -> None:
@@ -81,21 +97,12 @@ def validate_export_encryption(
         raise ConfigurationError(
             "Invalid NaCl encryption key for export restore"
         ) from None
-    expected = get_cloud_storage_data_encryption_metadata(encryption)
     target = metadata.get("target")
     if metadata.get("version") != 1 or not isinstance(target, dict):
         raise ConfigurationError("Invalid backup export encryption metadata")
-    key_id = target.get("key_id")
-    if (
-        any(
-            target.get(field) != expected[field]
-            for field in ("version", "type", "chunk_size")
-        )
-        or not isinstance(key_id, str)
-        or not hmac.compare_digest(key_id, expected["key_id"])
-    ):
+    if field := _encryption_mismatch(encryption, target):
         raise ConfigurationError(
-            "Restore encryption does not match the exported backup"
+            f"encryption.{field} does not match the exported backup"
         )
 
 
@@ -111,19 +118,9 @@ def validate_cloud_storage_data_encryption_config(
         )
 
     get_encryption(encryption_config["type"], encryption_config)
-    expected = get_cloud_storage_data_encryption_metadata(encryption_config)
-    for field in ("version", "type", "chunk_size"):
-        if metadata.get(field) != expected[field]:
-            raise ConfigurationError(
-                f"cloud_storage.data_encryption.{field} does not match backup metadata"
-            )
-
-    key_id = metadata.get("key_id")
-    if not isinstance(key_id, str) or not hmac.compare_digest(
-        key_id, expected["key_id"]
-    ):
+    if field := _encryption_mismatch(encryption_config, metadata):
         raise ConfigurationError(
-            "cloud_storage.data_encryption.key does not match backup metadata"
+            f"cloud_storage.data_encryption.{field} does not match backup metadata"
         )
     return encryption_config
 
